@@ -1,0 +1,18 @@
+name: magneto_gpu
+channels:
+  - defaults
+dependencies:
+  - gxx_linux-64
+  - python=3.11
+  - cuda-version=12.5
+  - cupy
+  - cuda-toolkit
+  - rapids=24.12
+  - statsmodels
+  - fastparquet
+  - netcdf4
+  - h5netcdf
+  - ipykernel
+  - cartopy
+  - seaborn
+

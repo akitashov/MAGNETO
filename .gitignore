@@ -1,0 +1,40 @@
+# --- Heavy Data Files ---
+*.parquet
+*.feather
+*.nc
+*.nc4
+*.zip
+*.dat
+*.hdf5
+*.h5
+
+# --- Documentation inside Data ---
+data/raw/OCO2/*.pdf
+data/raw/OCO2/*.json
+data/raw/ERA5/*.csv
+data/raw/ERA5/*.json
+data/raw/ERA5/*.md
+
+# --- System & Python ---
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+venv/
+.env
+
+# --- Results (Ignore fully) ---
+results/
+
+# --- Reports (Selective) ---
+!reports/
+reports/*
+!reports/figures/
+!reports/meta-statistics/
+!reports/figures/*.pdf
+!reports/figures/*.png
+!reports/figures/*.csv
+!reports/meta-statistics/*.csv
+
+# --- Logs ---
+*.log
