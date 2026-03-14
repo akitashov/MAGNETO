@@ -604,10 +604,11 @@ class Config:
         (0.05,  0.15),
         ]
 
-    P_FLOOR = 1e-16  # or 1e-300 if you prefer purely numerical safety
+    P_FLOOR = 1e-16  
 
     @staticmethod
     def sanitize_p(p: np.ndarray, floor: float = 1e-16) -> np.ndarray:
         p = np.asarray(p, dtype=float)
         return np.where(np.isfinite(p) & (p > 0), p, floor)
     
+    LOWER_FIG_LETTERS = False

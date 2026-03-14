@@ -193,7 +193,7 @@ def generate_driver_contribution_figure(target_var: str, scenario: str = 'Contro
             ax.text(0.5, 0.5, f"No data\n({bin_label})", ha='center', va='center',
                     transform=ax.transAxes, fontsize=Config.TICK_LABEL_SIZE, alpha=0.8)
             # --- Panel label + temperature range ---
-            letter = chr(ord('A') + i)
+            letter = chr(ord('a') + i) if CommonConfig.LOWER_FIG_LETTERS else chr(ord('A') + i)
 
             temp_range = Config.TEMP_BIN_RANGES.get(bin_label, bin_label)
 
@@ -281,7 +281,7 @@ def generate_driver_contribution_figure(target_var: str, scenario: str = 'Contro
         ax.set_xlim(0, len(unique_windows))
 
         # --- Panel label + temperature range (always) ---
-        letter = chr(ord('A') + i)
+        letter = chr(ord('a') + i) if CommonConfig.LOWER_FIG_LETTERS else chr(ord('A') + i)
         temp_range = Config.TEMP_BIN_RANGES.get(bin_label, bin_label)
 
         ax.text(

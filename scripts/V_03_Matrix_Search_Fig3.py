@@ -74,7 +74,7 @@ class Config:
     ABS_POWER_GAMMA = 0.65         
     COLORBAR_NBINS = 9             
 
-    PANEL_LABELS = ["A", "B", "C", "D"]
+    PANEL_LABELS = ["a", "b", "c", "d"] if CommonConfig.LOWER_FIG_LETTERS else ["A", "B", "C", "D"]
     PANEL_LABEL_POS = (-0.02, 1.05)
 
 

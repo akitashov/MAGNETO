@@ -30,10 +30,10 @@ results/
 !reports/
 reports/*
 !reports/figures/
+!reports/figures/**/*.pdf
+!reports/figures/**/*.png
+!reports/figures/**/*.csv
 !reports/meta-statistics/
-!reports/figures/*.pdf
-!reports/figures/*.png
-!reports/figures/*.csv
 !reports/meta-statistics/*.csv
 
 # --- Logs ---

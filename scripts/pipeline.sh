@@ -62,6 +62,10 @@ run_step "12_Meta_statistics.py"     # Matrix summary
 run_step "13_Pipeline_Consistency_Audit.py"
 run_step "14_Results_Sanity_Check.py"
 
+# Surrogate test
+
+run_step "15_Surrogate_test.py"
+
 printf '\n'
 printf '%0.s=' {1..38}; echo
 echo "PIPELINE COMPLETE: ALL STEPS FINISHED SUCCESSFULLY AT: $(date)"

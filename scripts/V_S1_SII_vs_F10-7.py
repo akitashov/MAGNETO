@@ -17,10 +17,11 @@ the figure to a CSV file.
 
 **Visual Encoding:**
 - Lines & Shading: Represent Spearman's rho and Fisher-transformed 95% CI.
-- Continuous Temperature Gradient: Solar lines (F10.7) are color-coded 
-  using a smooth 'YlOrBr' (Yellow-Orange-Brown) scale based on mean temperature.
-- Significance (p-adj): Encoded via transparency and line style. 
-  The legend is positioned in the bottom-right corner with optical 
+- Discrete Temperature Colors: Solar lines (F10.7) use discrete colors from 
+  the 'YlOrBr' colormap based on temperature bins.
+- Significance (p-adj): Encoded via transparency and line style 
+  (solid for p < 0.01, dashed otherwise) using thresholds from CommonConfig.
+- The legend is positioned in the bottom-right corner with optical 
   compensation for high-contrast lines.
 
 **Outputs:**
@@ -34,6 +35,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.cm import ScalarMappable
 from matplotlib.lines import Line2D
+import matplotlib.ticker as mticker
 import re
 from pathlib import Path
 import math
@@ -46,14 +48,24 @@ except ImportError:
     class GlobalConfig:
         PROJECT_ROOT = Path(".")
         RESULTS_DIR = Path(".")
+        # P_VALUE_LEVELS and P_FLOOR from _Common for consistency
+        P_VALUE_LEVELS = [
+            (1e-12, 1.0),
+            (1e-7,  0.8),
+            (1e-4,  0.6),
+            (1e-2,  0.4),
+            (0.5,   0.15),
+        ]
+        P_FLOOR = 1e-15
+        TEMP_RANGES = {0: "0-10", 1: "10-20", 2: "20-26", 3: "26-32", 4: "32+"}
 
 class Config:
     PROJECT_ROOT = GlobalConfig.PROJECT_ROOT
     INPUT_DIR = GlobalConfig.RESULTS_DIR
-    OUTPUT_DIR = PROJECT_ROOT / "reports" / "figures"
+    OUTPUT_DIR = PROJECT_ROOT / "reports" / "figures" / "supplementary"
     
     # Analysis Settings
-    SCENARIO = "Global_High_LAI" # UPDATED: Switched from Control_North
+    SCENARIO = "Global_High_LAI"
     TARGET_VAR = "sif_771nm"
     OMNI_STAT = "mean"
     
@@ -62,7 +74,7 @@ class Config:
 
     # Visual Style
     FIG_SIZE = (11, 7)
-    CMAP_F107 = "YlOrBr" # Yellow-Orange-Brown for Solar lines
+    CMAP_F107 = "YlOrBr"  # Keep YlOrBr for temperature lines
     LINE_WIDTH = 2.4
     CI_ALPHA_FACTOR = 0.25
     
@@ -72,17 +84,21 @@ class Config:
     AXIS_FONT_SIZE = int(13 * FONT_SCALE)
     TICK_FONT_SIZE = int(11 * FONT_SCALE)
     
-    # Statistical thresholds for opacity
-    P_VALUE_LEVELS = [
-        (1e-12, 1.0),
-        (1e-7,  0.8),
-        (1e-4,  0.6),
-        (1e-2,  0.4),
-        (0.5,   0.15),
-    ]
+    # Statistical thresholds from CommonConfig
+    P_VALUE_LEVELS = GlobalConfig.P_VALUE_LEVELS
+    P_FLOOR = GlobalConfig.P_FLOOR
     
-    # Axis Limits (consistent with Fig 1 style)
-    Y_LIM = (-0.12, 0.12)
+    # Axis Limits - UPDATED to -0.2 to 0.2 as requested
+    Y_LIM = (-0.2, 0.2)
+    
+    # Discrete temperature mapping (bin_id -> display name)
+    TEMP_LABELS = {
+        0: "Very Cold (0-10°C)",
+        1: "Cold (10-20°C)",
+        2: "Moderate (20-26°C)",
+        3: "Warm (26-32°C)",
+        4: "Hot (32°C+)"
+    }
     
     # Fallback mapping if metadata is missing
     TEMP_PROXY = {0: 5.0, 1: 15.0, 2: 23.0, 3: 28.0, 4: 35.0}
@@ -93,6 +109,8 @@ def extract_window(val_str):
 
 def p_to_alpha(p_val):
     if np.isnan(p_val): return 0.0
+    # Ensure p_val is positive for threshold comparison
+    p_val = max(p_val, Config.P_FLOOR)
     for threshold, alpha in Config.P_VALUE_LEVELS:
         if p_val <= threshold: return alpha
     return Config.P_VALUE_LEVELS[-1][1]
@@ -115,6 +133,10 @@ def calculate_fisher_ci(df):
     return df
 
 def plot_segmented_ci(ax, x, y_low, y_high, p_vals, color):
+    # Ensure p_vals are positive for alpha calculation
+    p_vals = np.asarray(p_vals, dtype=float)
+    p_vals = np.where(np.isfinite(p_vals) & (p_vals > 0), p_vals, Config.P_FLOOR)
+    
     point_alphas = [p_to_alpha(p) for p in p_vals]
     for i in range(len(x) - 1):
         line_alpha = (point_alphas[i] + point_alphas[i + 1]) / 2.0
@@ -124,10 +146,17 @@ def plot_segmented_ci(ax, x, y_low, y_high, p_vals, color):
                         color=color, alpha=ci_alpha, edgecolor="none", zorder=0)
 
 def plot_gradient_line(ax, x, y, p_vals, color):
+    p_vals = np.asarray(p_vals, dtype=float)
+    p_vals = np.where(np.isfinite(p_vals) & (p_vals > 0), p_vals, Config.P_FLOOR)
+    
     point_alphas = [p_to_alpha(p) for p in p_vals]
     for i in range(len(x) - 1):
         seg_alpha = (point_alphas[i] + point_alphas[i + 1]) / 2.0
-        ls = "-" if seg_alpha > Config.P_VALUE_LEVELS[-2][1] else "--"
+        
+        # solid if p < 0.01 else dashed (from Figure 1)
+        p_mid = np.nanmean([p_vals[i], p_vals[i + 1]])
+        ls = "-" if (np.isfinite(p_mid) and p_mid < 0.01) else "--"
+        
         ax.plot([x[i], x[i+1]], [y[i], y[i+1]], color=color, alpha=seg_alpha,
                 ls=ls, lw=Config.LINE_WIDTH, zorder=2)
 
@@ -145,6 +174,41 @@ def load_data(var_pattern: str) -> pd.DataFrame:
     df = df.dropna(subset=["window"]).sort_values("window")
     return calculate_fisher_ci(df)
 
+def add_pvalue_colorbar(fig, cax):
+    """Create p-value colorbar using thresholds from CommonConfig"""
+    # Get the unique alpha thresholds and corresponding p-values
+    p_thresholds = [t[0] for t in Config.P_VALUE_LEVELS if t[0] < 0.5]
+    # Add a reasonable max
+    p_thresholds.append(0.5)
+    
+    vmin = min(p_thresholds)
+    vmax = 0.5
+    
+    cmap = plt.cm.Greys_r
+    norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+
+    cbar = fig.colorbar(sm, cax=cax, orientation="horizontal")
+
+    label = "Transparency: adjusted p (log scale)"
+    cbar.set_label(label, fontsize=11)
+    cbar.ax.tick_params(labelsize=9)
+
+    # Set ticks at the p-value thresholds
+    ticks = [t for t in p_thresholds if t <= vmax]
+    cbar.set_ticks(ticks)
+
+    def fmt(t):
+        if t < 1e-1:
+            # Format as 10^{-x} for small values
+            exp = int(np.round(np.log10(t)))
+            return rf"$10^{{{exp}}}$"
+        return f"{t:g}"
+
+    cbar.set_ticklabels([fmt(t) for t in ticks])
+    return cbar
+
 def main():
     print(f"[INFO] Generating Figure S1 (Attribution) for {Config.SCENARIO}...")
     plt.style.use("seaborn-v0_8-whitegrid")
@@ -156,21 +220,21 @@ def main():
 
     export_list = [] # Collect data for export
 
-    # 1. Plot F10.7 (Solar Flux) - All Temperature Bins
+    # 1. Plot F10.7 (Solar Flux) - All Temperature Bins with discrete colors
     df_f107 = load_data("f10_7_mean_ma")
     bin_temps = {}
     n_bins = 0
-    norm_f107 = None # Will be initialized for colorbar
     
     if not df_f107.empty:
-        t_min, t_max = df_f107["temp_mean"].min(), df_f107["temp_mean"].max()
-        norm_f107 = mcolors.Normalize(vmin=t_min, vmax=t_max)
-        
         bin_ids = sorted(df_f107["bin_id"].unique())
-        n_bins = len(bin_ids) # UPDATE n_bins
+        n_bins = len(bin_ids)
+        
+        # Create discrete colormap from YlOrBr
         cmap = plt.get_cmap(Config.CMAP_F107)
+        # Generate evenly spaced colors for the number of bins
+        colors = [cmap(i / max(n_bins - 1, 1)) for i in range(n_bins)]
 
-        for b_id in bin_ids:
+        for idx, b_id in enumerate(bin_ids):
             bin_data = df_f107[df_f107["bin_id"] == b_id].sort_values("window")
             if bin_data.empty: continue
             
@@ -181,9 +245,9 @@ def main():
             export_list.append(exp_data)
 
             current_temp = bin_data["temp_mean"].mean()
-            bin_temps[b_id] = current_temp # Save for potential labels
+            bin_temps[b_id] = current_temp
             
-            c = cmap(norm_f107(current_temp))
+            c = colors[idx]
             
             plot_segmented_ci(ax, bin_data["window"].to_numpy(), bin_data["ci_lower"].to_numpy(),
                               bin_data["ci_upper"].to_numpy(), bin_data["p_adj"].to_numpy(), color=c)
@@ -212,57 +276,41 @@ def main():
             plot_gradient_line(ax, bin_data["window"].to_numpy(), bin_data["rho"].to_numpy(),
                                bin_data["p_adj"].to_numpy(), color=color)
 
-    # 3. Formatting
+    # 3. Formatting - UPDATED y-limits to -0.2, 0.2
     ax.axhline(0, color="black", lw=1.0, alpha=0.8)
-    ax.set_ylim(Config.Y_LIM)
+    ax.set_ylim(Config.Y_LIM)  # Now using (-0.2, 0.2)
     ax.set_ylabel(r"Spearman Correlation ($\rho$)", fontsize=Config.AXIS_FONT_SIZE)
     ax.set_xlabel("Integration Window (Days)", fontsize=Config.AXIS_FONT_SIZE)
     ax.tick_params(labelsize=Config.TICK_FONT_SIZE)
+    ax.grid(True, alpha=0.35)
+    
+    # Set y-axis ticks for better readability with new limits
+    ax.yaxis.set_major_locator(mticker.MultipleLocator(0.1))
+    ax.yaxis.set_minor_locator(mticker.MultipleLocator(0.05))
 
-    # 4. Legends
+    # 4. Legends - Create discrete temperature legend entries
     legend_elements = [
-        Line2D([0], [0], color='#1f77b4', lw=3, label=f'Geomagnetic ({Config.SII_BIN_LABEL})'),
-        Line2D([0], [0], color=plt.get_cmap(Config.CMAP_F107)(0.6), lw=3, label='Solar Flux F10.7 (All Regimes)')
+        Line2D([0], [0], color='#1f77b4', lw=3, label=f'SII ({Config.SII_BIN_LABEL})')
     ]
-    ax.legend(handles=legend_elements, loc='upper left', fontsize=12, framealpha=0.95)
+    
+    # Add discrete temperature entries for F10.7
+    if n_bins > 0:
+        cmap = plt.get_cmap(Config.CMAP_F107)
+        colors = [cmap(i / max(n_bins - 1, 1)) for i in range(n_bins)]
+        bin_ids = sorted(df_f107["bin_id"].unique()) if not df_f107.empty else []
+        
+        for idx, b_id in enumerate(bin_ids):
+            temp_label = Config.TEMP_LABELS.get(b_id, f"Bin {b_id}")
+            legend_elements.append(
+                Line2D([0], [0], color=colors[idx], lw=3, label=f'F10.7 {temp_label}')
+            )
+    
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=10, framealpha=0.95, 
+              ncol=2 if n_bins > 3 else 1)  # Use two columns if many bins
 
-    # Significance Scale
-    p_ax = fig.add_axes([0.68, 0.19, 0.15, 0.12]) 
-    p_ax.set_axis_off()
-    
-    p_ax.text(0, 1.1, "Significance (p-adj)", fontsize=11, fontweight='bold', transform=p_ax.transAxes)
-    
-    for i, (thresh, alpha_val) in enumerate(Config.P_VALUE_LEVELS):
-        y_pos = 0.85 - i * 0.22
-        
-        # Compensate for optical illusion at alpha=1.0 
-        current_lw = Config.LINE_WIDTH + 0.4 if alpha_val == 1.0 else Config.LINE_WIDTH
-        
-        ls = '-' if alpha_val > 0.4 else '--'
-        
-        # Draw line
-        p_ax.plot([0, 0.25], [y_pos, y_pos], 
-                  color='black', 
-                  lw=current_lw, 
-                  alpha=alpha_val, 
-                  ls=ls, 
-                  transform=p_ax.transAxes)
-        
-        # Text label
-        if thresh < 1e-3:
-            label = rf"$10^{{{int(math.log10(thresh))}}}$" # Removed "<" for compactness in powers
-        else:
-            label = f"{thresh:g}"
-            
-        p_ax.text(0.35, y_pos, rf"$p <$ {label}", va='center', fontsize=10, transform=p_ax.transAxes)
-            
-    # 5. Colorbar for F10.7 (Fixed block)
-    if n_bins > 0 and norm_f107 is not None:
-        cax = fig.add_axes([0.88, 0.15, 0.02, 0.7]) 
-        sm = ScalarMappable(cmap=plt.get_cmap(Config.CMAP_F107), norm=norm_f107)
-        sm.set_array([])
-        cb = fig.colorbar(sm, cax=cax)
-        cb.set_label("F10.7 Mean Temperature (°C)", fontsize=12)
+    # 5. p-value colorbar (using thresholds from CommonConfig)
+    cax_p = ax.inset_axes([0.55, 0.15, 0.3, 0.05])
+    add_pvalue_colorbar(fig, cax_p)
 
     Config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_file = Config.OUTPUT_DIR / "Fig_S1_Attribution.pdf"

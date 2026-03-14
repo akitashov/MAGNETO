@@ -59,6 +59,8 @@ class Config:
         "C": "SAA_High_LAI",
         "D": "Sahara_Barren",
     }
+    if CommonConfig.LOWER_FIG_LETTERS:
+        PANEL_SCENARIOS = {k.lower(): v for k,v in PANEL_SCENARIOS.items()}
 
     TARGET_VAR = ["sif_740nm", "sif_757nm", "sif_771nm", "sif_stress_index"]
     OMNI_STAT = "mean"
@@ -354,16 +356,17 @@ def process_variable(target_var):
     axB = fig.add_subplot(gs[1, 0])
     axC = fig.add_subplot(gs[1, 1])
     axD = fig.add_subplot(gs[1, 2])
-    axes = {"A": axA, "B": axB, "C": axC, "D": axD}
+    keys = list(Config.PANEL_SCENARIOS.keys())
+    axes = {keys[0]: axA, keys[1]: axB, keys[2]: axC, keys[3]: axD}
 
-    cmapA, normA, bin_idsA, n_binsA = draw_panel(axA, data["A"])
-    draw_panel(axB, data["B"])
-    draw_panel(axC, data["C"])
-    draw_panel(axD, data["D"])
+    cmapA, normA, bin_idsA, n_binsA = draw_panel(axA, data[keys[0]])
+    draw_panel(axB, data[keys[1]])
+    draw_panel(axC, data[keys[2]])
+    draw_panel(axD, data[keys[3]])
 
     # F10.7 Overlay (Panel A)
     f107_handle = None
-    df_f107 = load_f107_df(Config.PANEL_SCENARIOS["A"], target_var)
+    df_f107 = load_f107_df(Config.PANEL_SCENARIOS[keys[0]], target_var)
     if not df_f107.empty:
         target_bin = 1
         if target_bin not in df_f107["bin_id"].unique():
@@ -387,8 +390,8 @@ def process_variable(target_var):
             )
 
             f107_export = bin_data.copy()
-            f107_export["panel"] = "A"
-            f107_export["scenario"] = Config.PANEL_SCENARIOS["A"] + "_F10.7_Overlay"
+            f107_export["panel"] = keys[0]
+            f107_export["scenario"] = Config.PANEL_SCENARIOS[keys[0]] + "_F10.7_Overlay"
             export_list.append(f107_export)
 
     # Legend (Panel A)
@@ -448,7 +451,7 @@ def process_variable(target_var):
     axD.tick_params(labelleft=False)
     axA.set_ylabel(r"Spearman Correlation ($\rho$)", fontsize=Config.AXIS_FONT_SIZE)
 
-    for letter in ["C"]:
+    for letter in [keys[2]]:
         axes[letter].set_xlabel("Integration Window (Days)", fontsize=Config.AXIS_FONT_SIZE)
 
     for letter, ax in axes.items():
