@@ -1,0 +1,93 @@
+# Data directories
+data/
+external_data/
+raw/
+interim/
+processed/
+canonical/
+cache/
+
+# Generated outputs
+results/
+reports/
+outputs/
+figures/
+plots/
+tables/generated/
+manifests/
+logs/
+archive/
+backups/
+tmp/
+temp/
+
+# Local configuration
+config/*.local.yaml
+config/local/
+.env
+.env.*
+!.env.example
+
+# Scientific data formats
+*.parquet
+*.feather
+*.arrow
+*.nc
+*.nc4
+*.hdf
+*.h5
+*.zarr
+*.pkl
+*.pickle
+*.joblib
+
+# Generated tables
+*.generated.csv
+*_results.csv
+*_summary.csv
+*_output.csv
+
+# Generated documents and figures
+*.png
+*.tif
+*.tiff
+*.svg
+*.pdf
+*.docx
+*.pptx
+
+# Archives
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+
+# Runtime metadata
+*.log
+*.pid
+*.lock
+*_manifest.json
+*_audit.json
+*_report.json
+stage_*_status.*
+analysis_run_*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Local audit and inventory files
+LOCAL_DATA_INVENTORY.txt
+REPOSITORY_CONTENT_AUDIT_*.md
+repository_reorganization_*.md

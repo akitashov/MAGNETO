@@ -1,0 +1,47 @@
+# MAGNETO v1 preprint pipeline configuration
+# Copy this file to config/pipeline.local.yaml.
+# Note: v1 scripts read parameters from scripts/_Common.py; this file is
+# documentation-only and records the intended values for the corrected run.
+
+project:
+  name: MAGNETO_v1
+
+paths:
+  data_raw: data/raw
+  data_interim: data/interim
+  data_processed: data/processed
+  results: results
+  reports: reports
+  logs: logs
+
+grid:
+  target_resolution: 0.5
+  period_days: 8
+  last_start_doy: 361
+
+sif:
+  input_dir: data/raw/OCO2
+  file_glob: "oco2_LtSIF_*.nc4"
+  start_year: 2014
+  end_year: 2024
+  sif_min_threshold: 0.001
+  cloud_max: 60.0
+  aerosol_max: 50.0
+  lai_min: 0.4
+
+modis:
+  input_dir: data/raw/MODIS
+  file_pattern: "*.nc"
+  target_resolution: 0.5
+
+omni2:
+  input_zip: data/raw/omni2_all_years.zip
+
+era5:
+  input_dir: data/raw/ERA5
+  start_year: 2014
+  end_year_exclusive: 2025
+
+analysis:
+  sii_windows: [1, 90]
+  temperature_bins: [-Infinity, -1.0, 7.0, 15.0, 25.0, 30.0, Infinity]
