@@ -1,0 +1,25 @@
+# Copy this file to config/regions.local.yaml if local changes are required.
+# MAGNETO Geographic Region Definitions
+# Explicit coordinate bounds for named geographic controls.
+# Used as sensitivity analysis, not as primary evidence.
+
+regions:
+  Sahara:
+    name: "Sahara Desert"
+    type: "geographic_barren_control"
+    rationale: "Hyper-arid desert with near-zero vegetation. Negative control for SIF signal."
+    lat_range: [15.0, 32.0]
+    lon_range: [-18.0, 40.0]
+    flags: ["SAHARA", "LOW_LAI"]
+    exclude_flags: ["POLAR", "SAA"]
+
+# Flag bit assignments (from pipeline.yaml)
+flag_bits:
+  SAA: 1
+  CONTROL_NORTH: 2
+  POLAR: 4
+  SAHARA: 8
+  LOW_LAI: 16
+  HIGH_LAI: 32
+  DESERT: 64
+  REFERENCE_VEGETATED: 128

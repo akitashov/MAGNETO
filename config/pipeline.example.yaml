@@ -1,0 +1,243 @@
+# Copy this file to config/pipeline.local.yaml and edit local paths if needed.
+# MAGNETO canonical pipeline configuration
+# This file is the single source of truth for analysis parameters.
+# scripts/_Common.py loads these values into module-level constants.
+
+project:
+  name: MAGNETO
+  root_env: MAGNETO_ROOT
+
+paths:
+  data_raw: data/raw
+  data_interim: data/interim
+  data_processed: data/processed
+  results: results
+  reports: reports
+  logs: logs
+
+inputs:
+  # Primary analytical SIF input is the promoted central-only MODIS-match candidate.
+  # The hierarchical-match candidate is retained as a sensitivity input.
+  file_sif: data/interim/sif_aggregated.feather
+  file_omni: data/interim/omni_biosphere_features.feather
+  file_era5: data/interim/era5_env_daily.parquet
+  file_modis: data/interim/modis_extract.parquet
+
+oco2:
+  # Upstream OCO-2 SIF ETL configuration. Stage scripts/etl/E03_sif_etl.py reads the raw
+  # OCO-2 LtSIF NetCDF files and produces data/interim/sif_aggregated.feather.
+  # The canonical spatial grid is 0.5° × 0.5°.
+  input_dir: data/raw/OCO2
+  file_glob: "oco2_LtSIF_*.nc4"
+  start_year: 2014
+  end_year: 2024
+  target_resolution: 0.5
+  sif_min_threshold: 0.001
+  files_subbatch: 50
+  filters:
+    cloud_max: 60.0
+    aerosol_max: 50.0
+    lai_min: 0.01
+  # If multiple OCO-2 product builds exist for one date, keep the build with
+  # the lexicographically largest build tag (transparent, reproducible tie-break).
+  deduplicate_builds: true
+  modis_dilation:
+    # Default is no spatial dilation.  Central matching against the conservatively
+    # regridded MODIS product should cover essentially all land SIF observations.
+    # If the central match rate falls below ``central_match_min_rate``, the SIF
+    # ETL stops and reports the unmatched cells rather than silently falling back
+    # to a nearest-neighbour rule.
+    mode: "none"
+    radius: 1
+  central_match_min_rate: 0.99
+  region_flags:
+    # Bit assignments must match analysis_area_filter.keep_flags / exclude_flags
+    # and config/regions.yaml flag_bits.
+    bits:
+      SAA: 1
+      CONTROL_NORTH: 2
+      POLAR: 4
+      SAHARA: 8
+      LOW_LAI: 16
+      HIGH_LAI: 32
+    # Geographic boxes used by the historical upstream SIF ETL. These are the
+    # definitions that produced the current sif_aggregated.feather.
+    boxes:
+      SAA: {lat_min: -50.0, lat_max: 0.0, lon_min: -90.0, lon_max: 10.0}
+      SAHARA: {lat_min: 15.0, lat_max: 30.0, lon_min: -15.0, lon_max: 35.0}
+      CONTROL_NA: {lat_min: 25.0, lat_max: 60.0, lon_min: -130.0, lon_max: -60.0}
+      CONTROL_EUASIA: {lat_min: 25.0, lat_max: 60.0, lon_min: -10.0, lon_max: 140.0}
+    polar_lat_abs: 60.0
+    lai_vegetation_threshold: 0.15
+
+# Upstream ETL configurations: MODIS, OMNI2 and ERA5.  The scripts
+# scripts/etl/E01_modis_etl.py, scripts/etl/E02_omni_etl.py and
+# scripts/etl/E05_era5_etl.py write the canonical inputs declared in
+# ``inputs`` above.
+modis:
+  input_dir: data/raw/MODIS
+  file_pattern: "*.nc"
+  # Canonical spatial grid: 0.5° × 0.5°.
+  target_resolution: 0.5
+  period_days: 8
+  last_start_doy: 361
+
+omni2:
+  input_zip: data/raw/omni2_all_years.zip
+  # OMNI2 stores Kp in units of 0.1 × Kp (integer 0–90).  The ETL keeps the
+  # raw scale in kp_mean; downstream comparisons should report Kp/10 or note
+  # that values are in 0.1-Kp units.
+  kp_scale: 0.1
+
+era5:
+  input_dir: data/raw/ERA5
+  start_year: 2014
+  end_year_exclusive: 2025
+  # Canonical spatial grid: 0.5° × 0.5°.
+  target_resolution: 0.5
+
+interim_outputs:
+  file_qc: data/interim/global_qc.parquet
+  file_lai_cells: data/interim/lai_cell_summary.parquet
+  file_lai_bounds: data/interim/lai_quartile_boundaries.json
+  file_lai_members: data/interim/lai_quartile_membership.parquet
+  file_control_members: data/interim/control_membership.parquet
+
+processed_outputs:
+  file_harmonic_analysis: data/processed/harmonic_analysis.parquet
+  file_cyclic_spline_analysis: data/processed/cyclic_spline_analysis.parquet
+  file_matched_harmonic_spline: data/processed/harmonic_spline_matched.parquet
+
+results_outputs:
+  file_fixed: results/fixed_window_results.csv
+  file_surrogates: results/surrogate_summary.csv
+  file_surrogate_null: results/surrogate_null_distributions.parquet
+  file_effects: results/effect_sizes.csv
+  file_qc_flow: results/qc_flow.csv
+  file_control_definitions: results/control_definitions.json
+  file_control_diagnostics: results/control_diagnostics.csv
+  file_geographic_control_diagnostics: results/geographic_control_diagnostics.csv
+  file_lai_quartile_diagnostics: results/lai_quartile_diagnostics.csv
+  file_doy_coverage: results/doy_coverage_by_window.csv
+  file_sif_value_diagnostics: results/sif_value_diagnostics.csv
+  file_smoke_subset_diagnostics: results/smoke_subset_diagnostics.csv
+  file_output_manifest: results/output_manifest.json
+  file_output_manifest_csv: results/output_manifest.csv
+
+analysis:
+  targets:
+    - sif_771nm
+  sii_windows:
+    - 21
+    - 28
+  # 28 days is the operational four-week exposure window used in the main figures.
+  # 21 days is the sensitivity window.
+  primary_sii_window: 28
+  secondary_sii_window: 21
+  residual_methods:
+    - harmonic
+    - cyclic_spline
+  lai_n_quartiles: 4
+
+qc:
+  # Cloud and aerosol filters come from MODIS quality data.
+  cloud_max: 60.0
+  aerosol_max: 50.0
+  # The old sif_771nm >= 0.001 truncation is disabled in the primary analysis.
+  # It is available only as an explicit sensitivity flag.
+  sif_min: null
+  sensitivity_sif_min: 0.001
+  lat_min: -60
+  lat_max: 75
+
+analysis_area_filter:
+  # The input SIF dataset is already land-only from upstream OCO-2 ETL.
+  # This filter only excludes POLAR (bit 4) retrievals from the analysis area.
+  # Water retrievals were removed before aggregation; see reports/SIF_QC_AUDIT.md.
+  keep_flags:
+    - 16
+    - 32
+  exclude_flags:
+    - 4
+
+lai:
+  use_full_modis_series: true
+  quartile_population_flags:
+    - 16
+    - 32
+
+controls:
+  functional:
+    # Thresholds chosen before inspecting SII-SIF correlations.
+    # Strict low-LAI control = persistently low LAI (median and Q90 both low).
+    strict_low_lai:
+      name: control_strict_low_lai
+      median_lai_max: 0.10
+      q90_lai_max: 0.30
+      min_lai_obs: 10
+    # Vegetated reference = persistently high LAI (median and Q10 both high).
+    vegetated:
+      name: Persistently_Vegetated
+      median_lai_min: 1.00
+      q10_lai_min: 0.30
+      min_lai_obs: 10
+  geographic:
+    # Region definitions are loaded from config/regions.yaml.
+    config_path: config/regions.yaml
+
+temperature:
+  era5_temp_col: temp_c_ma10
+  bins:
+    - -Infinity
+    - -1.0
+    - 7.0
+    - 15.0
+    - 25.0
+    - 30.0
+    - Infinity
+  labels:
+    - Frozen
+    - Cold
+    - Cool
+    - Optimum
+    - Warm_Stress
+    - Extreme_Heat
+
+detrending:
+  harmonic_min_obs: 40
+  harmonic_min_years: 3
+  cyclic_spline_df: 8
+  cyclic_spline_min_obs: 40
+  cyclic_spline_min_years: 3
+
+sii:
+  raw_col: sii_mean
+  # Current observation day is excluded from the exposure window.
+  shift_before_roll: true
+  min_periods: null
+
+surrogates:
+  n: 1000
+  smoke_n: 10
+  seed: 20260717
+  circ_shift_min: 30
+  block_size: 30
+  modes:
+    - year_perm
+    - circ_shift
+    - block_perm
+
+smoke:
+  years:
+    - 2015
+    - 2016
+    - 2017
+    - 2018
+    - 2019
+    - 2020
+  cell_sample_size: 500
+  deterministic_seed: 20260722
+  min_years_per_cell: 3
+
+performance:
+  parquet_engine: pyarrow

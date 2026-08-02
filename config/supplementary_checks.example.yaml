@@ -1,0 +1,137 @@
+# Copy this file to config/supplementary_checks.local.yaml and edit local paths if needed.
+# MAGNETO supplementary_checks analysis configuration.
+# These settings control the additional S01...S09 scripts in scripts/supplementary_checks/.
+# They are intentionally separate from the canonical pipeline.yaml so that the
+# core SIF 771 nm analysis remains unchanged.
+
+project:
+  name: MAGNETO
+  supplementary_checks_tag: supplementary_checks
+
+paths:
+  results_supplementary_checks: results/supplementary_checks
+  reports_supplementary_checks: reports/supplementary_checks
+  figures_supplementary_checks: figures/supplementary_checks
+  data_supplementary_checks: data/interim/supplementary_checks
+
+primary_outcome: sif_771nm
+primary_methods:
+  - harmonic
+  - cyclic_spline
+
+windows:
+  full_scan: [1, 90]
+  fixed: [21, 28]
+
+temperature:
+  classes:
+    - Frozen
+    - Cold
+    - Cool
+    - Optimum
+    - Warm_Stress
+    - Extreme_Heat
+
+surrogates:
+  # Default N for supplementary checks sensitivity runs. Smoke tests should override this.
+  n: 1000
+  smoke_n: 10
+  seed: 20260724
+  modes:
+    - year_perm
+    - circ_shift
+    - block_perm
+
+landcover:
+  # Path to the 2022 MCD12C1 Version 6.1 IGBP classification on a regular lat/lon
+  # grid. The script expects a NetCDF4 file with variables:
+  #   lat, lon, land_cover (integer IGBP classes 1-17).
+  # If the file is absent, S05 prints download instructions and exits cleanly.
+  source_path: data/interim/MCD12C1.A2022001.061.2023244164746.nc
+  source_year: 2022
+  source_product: MCD12C1 Version 6.1 IGBP
+  # Minimum fraction of the 0.5° analysis-grid cell that must belong to the
+  # dominant class before the cell is assigned that class. Cells below the
+  # threshold are labelled "Mixed/Other Vegetation".
+  majority_threshold: 0.5
+  igbp_map:
+    1: Forest
+    2: Forest
+    3: Forest
+    4: Forest
+    5: Forest
+    6: Shrubland/Savanna
+    7: Shrubland/Savanna
+    8: Shrubland/Savanna
+    9: Savanna
+    10: Grassland
+    11: Wetlands
+    12: Cropland
+    13: Urban
+    14: Cropland
+    15: Snow/Ice
+    16: Barren
+    17: Water
+
+scenarios:
+  # Scenario identifiers used by the graphical-abstract and temperature figures.
+  main_scenarios:
+    - pooled_full
+    - control_vegetated
+    - control_strict_low_lai
+    - control_Sahara
+  include_saa: true
+  include_landcover: true
+
+scenario_registry:
+  - scenario_id: pooled_full
+    display_label: Full sample
+    definition: Global pooled SIF 771-nm analytical sample
+    analytical_role: primary
+    inference_status: main
+  - scenario_id: control_vegetated
+    display_label: Persistently vegetated
+    definition: median LAI >= 1.0, 10th percentile LAI >= 0.30, at least 10 valid LAI observations
+    analytical_role: primary biological reference
+    inference_status: main
+  - scenario_id: control_strict_low_lai
+    display_label: Strict low-LAI control
+    definition: median LAI <= 0.10, 90th percentile LAI <= 0.30, at least 10 valid LAI observations
+    analytical_role: descriptive sensitivity control
+    inference_status: descriptive_only
+  - scenario_id: control_Sahara
+    display_label: Sahara geographic control
+    definition: Rectangular geographic approximation 15-32° N, 18° W-40° E
+    analytical_role: geographic control
+    inference_status: main
+  - scenario_id: landcover_barren
+    display_label: Barren land-cover class
+    definition: Dominant MCD12C1 land-cover class == Barren on the 0.5° analysis grid
+    analytical_role: primary land-cover barren comparison
+    inference_status: main
+
+outputs:
+  window_scan_csv: window_scan_771.csv
+  window_scan_fig: window_scan_771.png
+  kp_comparison_csv: kp_comparison.csv
+  kp_comparison_fig: kp_comparison.png
+  f107_comparison_csv: f107_comparison.csv
+  f107_comparison_fig: f107_comparison.png
+  saa_control_csv: saa_control.csv
+  saa_control_surrogate_csv: saa_control_surrogates.csv
+  saa_control_fig: saa_control.png
+  control_temperature_csv: control_temperature_profiles.csv
+  control_temperature_surrogate_csv: control_temperature_profiles_surrogates.csv
+  landcover_grid_parquet: landcover_cell_grid.parquet
+  landcover_diagnostics_csv: landcover_grid_diagnostics.csv
+  landcover_analysis_csv: landcover_analysis.csv
+  landcover_analysis_fig: landcover_analysis.png
+  landcover_temperature_inference_csv: landcover_temperature_inference.csv
+  sii_environment_correlation_csv: sii_environment_correlation.csv
+  driver_r2_shapley_long_csv: driver_r2_shapley_long.csv
+  driver_r2_shapley_models_csv: driver_r2_shapley_models.csv
+  driver_r2_shapley_by_window_csv: driver_r2_shapley_by_window.csv
+  graphical_abstract_fig: graphical_abstract_matrix.png
+  supplementary_checks_manifest_json: supplementary_checks_manifest.json
+  supplementary_checks_manifest_csv: supplementary_checks_manifest.csv
+  supplementary_checks_readme: README_SUPPLEMENTARY_CHECKS.md

@@ -1,0 +1,11 @@
+name: magneto_gpu
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - cuda-version=12.5
+  - cuda-toolkit
+  - pip
+  - pip:
+    - -r requirements-lock.txt

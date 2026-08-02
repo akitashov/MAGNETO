@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the preprint and the software."
+type: software
+title: "MAGNETO: Magnetosphere-Atmosphere-Geosphere Interaction Network & Ecological Trend Observer"
+version: 2026.07.17
+date-released: 2026-07-17
+authors:
+  - family-names: Kitashov
+    given-names: Andrey V.
+repository-code: "https://github.com/akitashov/MAGNETO"
+license: MIT
+preferred-citation:
+  type: article
+  title: "Cumulative geomagnetic disturbances modulate global photosystem stoichiometry through temperature-dependent gating"
+  authors:
+    - family-names: Kitashov
+      given-names: Andrey V.
+  year: 2026
+  doi: "10.64898/2026.02.17.706448"
+  journal: "bioRxiv preprint"
