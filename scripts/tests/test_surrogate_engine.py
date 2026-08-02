@@ -37,7 +37,18 @@ def _simple_daily_df() -> pd.DataFrame:
 
 
 def test_build_daily_sii_no_nans_after_interpolation():
-    """After interpolation the surrogate daily SII must be fully finite."""
+    """After interpolation the surrogate daily SII must be fully finite.
+
+    This test requires the external OMNI biosphere feature dataset. In the
+    source-only repository the dataset is intentionally omitted, so the test
+    is skipped when the configured input file is absent.
+    """
+    from magneto_lib import FILE_OMNI
+
+    if not FILE_OMNI.exists():
+        pytest.skip(
+            "External integration dataset is not available in the source-only repository"
+        )
     df = build_daily_sii()
     filled = (
         df["sii_mean"]
