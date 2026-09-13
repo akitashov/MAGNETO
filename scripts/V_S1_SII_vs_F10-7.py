@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Figure S1 Generator: Attribution Analysis (Spearman rho).
+Figure S1 Generator: Descriptive attribution comparison (Spearman rho).
 
 **Description:**
 This script generates a diagnostic visualization to disentangle the effects
 of solar activity (F10.7) and geomagnetic/ionospheric perturbations (SII)
 on SIF across various thermal regimes. It also exports the source data for
 the figure to a CSV file.
+
+The figure is purely descriptive: all curves are drawn with fixed line
+opacity and a fixed line style. No confidence intervals and no p-value-derived
+transparency, line styles, or significance legends are shown.
 
 **Layout:**
 - Single Panel: Focuses on the Global High LAI scenario to compare drivers.
@@ -16,12 +20,11 @@ the figure to a CSV file.
   across all temperature regimes, enabling attribution of SIF variability.
 
 **Visual Encoding:**
-- Lines & Shading: Represent Spearman's rho and Fisher-transformed 95% CI.
 - Continuous Temperature Gradient: Solar lines (F10.7) are color-coded
   using a smooth 'YlOrBr' (Yellow-Orange-Brown) scale based on mean temperature.
-- Significance (p-adj): Encoded via transparency and line style.
-  The legend is positioned in the bottom-right corner with optical
-  compensation for high-contrast lines.
+- All curves use uniform opacity and a fixed solid line style.
+- A colorbar maps the F10.7 line colors to the mean temperature (deg C)
+  of the corresponding thermal regime.
 
 **Outputs:**
 - PDF image: `reports/figures/supplementary/Fig_S1_Attribution.pdf`
@@ -36,7 +39,6 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.lines import Line2D
 import re
 from pathlib import Path
-import math
 
 # --- Pipeline Integration ---
 try:
@@ -64,22 +66,13 @@ class Config:
     FIG_SIZE = (11, 7)
     CMAP_F107 = "YlOrBr" # Yellow-Orange-Brown for Solar lines
     LINE_WIDTH = 2.4
-    CI_ALPHA_FACTOR = 0.25
+    LINE_ALPHA = 0.95
 
     # Fonts
     FONT_SCALE = 1.6
     BASE_FONT = 11
     AXIS_FONT_SIZE = int(13 * FONT_SCALE)
     TICK_FONT_SIZE = int(11 * FONT_SCALE)
-
-    # Statistical thresholds for opacity
-    P_VALUE_LEVELS = [
-        (1e-12, 1.0),
-        (1e-7,  0.8),
-        (1e-4,  0.6),
-        (1e-2,  0.4),
-        (0.5,   0.15),
-    ]
 
     # Axis Limits (consistent with Fig 1 style)
     Y_LIM = (-0.12, 0.12)
@@ -91,45 +84,16 @@ def extract_window(val_str):
     match = re.search(r"ma(\d+)", str(val_str))
     return int(match.group(1)) if match else None
 
-def p_to_alpha(p_val):
-    if np.isnan(p_val): return 0.0
-    for threshold, alpha in Config.P_VALUE_LEVELS:
-        if p_val <= threshold: return alpha
-    return Config.P_VALUE_LEVELS[-1][1]
-
-def calculate_fisher_ci(df):
-    """Calculates 95% CI and handles missing metadata."""
-    if 'p_adj' not in df.columns:
-        df['p_adj'] = df.get('p_value', 1.0)
-
-    if 'temp_mean' not in df.columns and 'bin_id' in df.columns:
-        df['temp_mean'] = df['bin_id'].map(Config.TEMP_PROXY)
-
-    if 'ci_lower' not in df.columns and 'rho' in df.columns:
-        n = df.get('n_eff', df.get('n', 100))
-        r = df['rho'].clip(-0.99, 0.99)
-        z = np.arctanh(r)
-        sigma = 1.0 / np.sqrt(np.maximum(n - 3, 1))
-        df['ci_lower'] = np.tanh(z - 1.96 * sigma)
-        df['ci_upper'] = np.tanh(z + 1.96 * sigma)
+def fill_temp_mean(df):
+    """Fill missing mean-temperature metadata used only for line coloring."""
+    if "temp_mean" not in df.columns and "bin_id" in df.columns:
+        df["temp_mean"] = df["bin_id"].map(Config.TEMP_PROXY)
     return df
 
-def plot_segmented_ci(ax, x, y_low, y_high, p_vals, color):
-    point_alphas = [p_to_alpha(p) for p in p_vals]
-    for i in range(len(x) - 1):
-        line_alpha = (point_alphas[i] + point_alphas[i + 1]) / 2.0
-        ci_alpha = line_alpha * Config.CI_ALPHA_FACTOR
-        if ci_alpha < 0.01: continue
-        ax.fill_between([x[i], x[i+1]], [y_low[i], y_low[i+1]], [y_high[i], y_high[i+1]],
-                        color=color, alpha=ci_alpha, edgecolor="none", zorder=0)
-
-def plot_gradient_line(ax, x, y, p_vals, color):
-    point_alphas = [p_to_alpha(p) for p in p_vals]
-    for i in range(len(x) - 1):
-        seg_alpha = (point_alphas[i] + point_alphas[i + 1]) / 2.0
-        ls = "-" if seg_alpha > Config.P_VALUE_LEVELS[-2][1] else "--"
-        ax.plot([x[i], x[i+1]], [y[i], y[i+1]], color=color, alpha=seg_alpha,
-                ls=ls, lw=Config.LINE_WIDTH, zorder=2)
+def plot_fixed_line(ax, x, y, color):
+    """Plot a single descriptive curve with fixed style and uniform opacity."""
+    ax.plot(x, y, color=color, alpha=Config.LINE_ALPHA, ls="-",
+            lw=Config.LINE_WIDTH, zorder=2)
 
 def load_data(var_pattern: str) -> pd.DataFrame:
     csv_file = Config.INPUT_DIR / f"spearman_{Config.TARGET_VAR}_{Config.SCENARIO}.csv"
@@ -143,7 +107,7 @@ def load_data(var_pattern: str) -> pd.DataFrame:
 
     df["window"] = df["omni_var"].apply(extract_window)
     df = df.dropna(subset=["window"]).sort_values("window")
-    return calculate_fisher_ci(df)
+    return fill_temp_mean(df)
 
 def main():
     print(f"[INFO] Generating Figure S1 (Attribution) for {Config.SCENARIO}...")
@@ -158,7 +122,6 @@ def main():
 
     # 1. Plot F10.7 (Solar Flux) - All Temperature Bins
     df_f107 = load_data("f10_7_mean_ma")
-    bin_temps = {}
     n_bins = 0
     norm_f107 = None # Will be initialized for colorbar
 
@@ -167,7 +130,7 @@ def main():
         norm_f107 = mcolors.Normalize(vmin=t_min, vmax=t_max)
 
         bin_ids = sorted(df_f107["bin_id"].unique())
-        n_bins = len(bin_ids) # UPDATE n_bins
+        n_bins = len(bin_ids)
         cmap = plt.get_cmap(Config.CMAP_F107)
 
         for b_id in bin_ids:
@@ -181,14 +144,10 @@ def main():
             export_list.append(exp_data)
 
             current_temp = bin_data["temp_mean"].mean()
-            bin_temps[b_id] = current_temp # Save for potential labels
-
             c = cmap(norm_f107(current_temp))
 
-            plot_segmented_ci(ax, bin_data["window"].to_numpy(), bin_data["ci_lower"].to_numpy(),
-                              bin_data["ci_upper"].to_numpy(), bin_data["p_adj"].to_numpy(), color=c)
-            plot_gradient_line(ax, bin_data["window"].to_numpy(), bin_data["rho"].to_numpy(),
-                               bin_data["p_adj"].to_numpy(), color=c)
+            plot_fixed_line(ax, bin_data["window"].to_numpy(),
+                            bin_data["rho"].to_numpy(), color=c)
 
     # 2. Plot SII (Geomagnetic) - Selected Bin Only
     df_sii = load_data(f"sii_{Config.OMNI_STAT}_ma")
@@ -207,10 +166,8 @@ def main():
             export_list.append(exp_data)
 
             color = '#1f77b4' # Strong Blue
-            plot_segmented_ci(ax, bin_data["window"].to_numpy(), bin_data["ci_lower"].to_numpy(),
-                              bin_data["ci_upper"].to_numpy(), bin_data["p_adj"].to_numpy(), color=color)
-            plot_gradient_line(ax, bin_data["window"].to_numpy(), bin_data["rho"].to_numpy(),
-                               bin_data["p_adj"].to_numpy(), color=color)
+            plot_fixed_line(ax, bin_data["window"].to_numpy(),
+                            bin_data["rho"].to_numpy(), color=color)
 
     # 3. Formatting
     ax.axhline(0, color="black", lw=1.0, alpha=0.8)
@@ -219,44 +176,14 @@ def main():
     ax.set_xlabel("Integration Window (Days)", fontsize=Config.AXIS_FONT_SIZE)
     ax.tick_params(labelsize=Config.TICK_FONT_SIZE)
 
-    # 4. Legends
+    # 4. Legend
     legend_elements = [
-        Line2D([0], [0], color='#1f77b4', lw=3, label=f'Geomagnetic ({Config.SII_BIN_LABEL})'),
+        Line2D([0], [0], color='#1f77b4', lw=3, label=f'Geomagnetic (SII, {Config.SII_BIN_LABEL})'),
         Line2D([0], [0], color=plt.get_cmap(Config.CMAP_F107)(0.6), lw=3, label='Solar Flux F10.7 (All Regimes)')
     ]
     ax.legend(handles=legend_elements, loc='upper left', fontsize=12, framealpha=0.95)
 
-    # Significance Scale
-    p_ax = fig.add_axes([0.68, 0.19, 0.15, 0.12])
-    p_ax.set_axis_off()
-
-    p_ax.text(0, 1.1, "Significance (p-adj)", fontsize=11, fontweight='bold', transform=p_ax.transAxes)
-
-    for i, (thresh, alpha_val) in enumerate(Config.P_VALUE_LEVELS):
-        y_pos = 0.85 - i * 0.22
-
-        # Compensate for optical illusion at alpha=1.0
-        current_lw = Config.LINE_WIDTH + 0.4 if alpha_val == 1.0 else Config.LINE_WIDTH
-
-        ls = '-' if alpha_val > 0.4 else '--'
-
-        # Draw line
-        p_ax.plot([0, 0.25], [y_pos, y_pos],
-                  color='black',
-                  lw=current_lw,
-                  alpha=alpha_val,
-                  ls=ls,
-                  transform=p_ax.transAxes)
-
-        # Text label
-        if thresh < 1e-3:
-            label = rf"$10^{{{int(math.log10(thresh))}}}$" # Removed "<" for compactness in powers
-        else:
-            label = f"{thresh:g}"
-
-        p_ax.text(0.35, y_pos, rf"$p <$ {label}", va='center', fontsize=10, transform=p_ax.transAxes)
-
-    # 5. Colorbar for F10.7 (Fixed block)
+    # 5. Colorbar for F10.7 (temperature, not a p-value scale)
     if n_bins > 0 and norm_f107 is not None:
         cax = fig.add_axes([0.88, 0.15, 0.02, 0.7])
         sm = ScalarMappable(cmap=plt.get_cmap(Config.CMAP_F107), norm=norm_f107)

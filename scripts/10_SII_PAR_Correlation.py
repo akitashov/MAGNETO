@@ -61,27 +61,22 @@ def smart_date_conversion(series):
         else: return pd.to_datetime(series, unit='ns', origin='unix')
     return pd.to_datetime(series)
 
-def calculate_neff_factor(series_x, series_y):
-    def lag1(s):
-        valid = s[np.isfinite(s)]
-        if len(valid) < 5: return 0.0
-        return np.corrcoef(valid[:-1], valid[1:])[0, 1]
-    r1_x = np.clip(lag1(series_x), -0.99, 0.99)
-    r1_y = np.clip(lag1(series_y), -0.99, 0.99)
-    prod = r1_x * r1_y
-    return (1 - prod) / (1 + prod)
-
-def calculate_stats(x, y, neff_factor):
+def calculate_stats(x, y):
+    """
+    Compute Spearman rho and raw sample size.
+    Pooled space-time effective sample size is intentionally not computed.
+    """
     n_raw = len(x)
+    if n_raw < 3:
+        return np.nan, n_raw
     rho, _ = stats.spearmanr(x, y)
-    n_eff = max(2, n_raw * neff_factor)
-    return rho, n_eff, n_raw
+    return rho, n_raw
 
-def p_value_from_t(rho, n_eff):
+def p_value_from_t(rho, n_raw):
     if abs(rho) >= 1.0: return 0.0
-    if n_eff <= 2: return 1.0
-    t_stat = rho * np.sqrt((n_eff - 2) / (1 - rho**2))
-    return 2 * (1 - stats.t.cdf(abs(t_stat), df=n_eff - 2))
+    if n_raw <= 2: return 1.0
+    t_stat = rho * np.sqrt((n_raw - 2) / (1 - rho**2))
+    return 2 * (1 - stats.t.cdf(abs(t_stat), df=n_raw - 2))
 
 def get_temp_col(schema_names):
     if TEMP_COLUMN in schema_names: return TEMP_COLUMN
@@ -115,6 +110,8 @@ def stream_filtered_era5(target_cols, flags_df):
 
 def main():
     Config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    Config.REPORTS_INTEGRITY_DIR.mkdir(parents=True, exist_ok=True)
+    join_ledger: list[dict] = []
 
     # 1. LOAD METADATA
     print("[INFO] Loading Metadata...")
@@ -133,7 +130,10 @@ def main():
     # --- PART A: GLOBAL SCREENING (SII vs SIF) ---
     print("\n[PART A] Running Global Screening (SII vs SIF)...")
     daily_sif = flags.groupby('date')[cols_to_read[4:]].mean().reset_index() # Skip geo cols
-    merged_sif = pd.merge(daily_sif, omni, on='date', how='inner')
+    merged_sif = Config.merge_with_accounting(
+        daily_sif, omni, on='date', how='inner', validate='many_to_one',
+        stage='screening_global_sif_x_omni', ledger=join_ledger,
+    )
 
     screening_results = []
     sii_driver = 'sii_mean'
@@ -186,9 +186,25 @@ def main():
         if filtered_era5.empty: continue
 
         # 2. Merge Context
-        filtered_era5 = pd.merge(filtered_era5, flags[['date', 'lat_id', 'lon_id', 'region_flags']], on=['date', 'lat_id', 'lon_id'], how='left')
+        filtered_era5 = Config.merge_with_accounting(
+            filtered_era5,
+            flags[['date', 'lat_id', 'lon_id', 'region_flags']],
+            on=['date', 'lat_id', 'lon_id'],
+            how='left',
+            validate='many_to_one',
+            stage='mechanism_era5_x_flags',
+            ledger=join_ledger,
+        )
         omni_cols = ['date'] + [f"sii_mean_ma{w}" for w in active_windows]
-        df_final = pd.merge(filtered_era5, omni[omni_cols], on='date', how='inner')
+        df_final = Config.merge_with_accounting(
+            filtered_era5,
+            omni[omni_cols],
+            on='date',
+            how='inner',
+            validate='many_to_one',
+            stage='mechanism_era5_x_omni',
+            ledger=join_ledger,
+        )
 
         del filtered_era5
         gc.collect()
@@ -202,9 +218,7 @@ def main():
                 sc_data = df_final[mask].copy()
                 if len(sc_data) < MIN_SAMPLES: continue
 
-                try:
-                    sc_data = sc_data.join(Config.bin_temperature(sc_data[temp_col]))
-                except: continue
+                sc_data = sc_data.join(Config.bin_temperature(sc_data[temp_col]))
 
                 for b_id in sc_data["temp_bin_id"].unique():
                     if pd.isna(b_id): continue
@@ -218,13 +232,14 @@ def main():
                         v = bin_data[[omni_driver, env_target]].dropna()
                         if len(v) < MIN_SAMPLES: continue
 
-                        neff_f = calculate_neff_factor(v[omni_driver].values, v[env_target].values)
-                        rho, n_eff, n_raw = calculate_stats(v[omni_driver].values, v[env_target].values, neff_f)
+                        rho, n_raw = calculate_stats(v[omni_driver].values, v[env_target].values)
 
                         mech_results_raw.append({
                             "scenario": sc, "bin_id": int(b_id),
                             "parameter_1": env_target, "window": w,
-                            "rho": rho, "n_eff": n_eff
+                            "rho": rho, "n": n_raw,
+                            "n_eff": np.nan,
+                            "inference_method": "not_computed_legacy_neff_invalid",
                         })
         del df_final
         gc.collect()
@@ -233,20 +248,18 @@ def main():
     if mech_results_raw:
         df_res = pd.DataFrame(mech_results_raw)
         df_res['z'] = np.arctanh(df_res['rho'].clip(-0.99, 0.99))
-        df_res['weight'] = np.maximum(df_res['n_eff'] - 3, 1)
+        # Use raw sample size as weight (legacy pooled n_eff is invalid).
+        df_res['weight'] = np.maximum(df_res['n'] - 3, 1)
 
         final_mech = []
-        # Group by Scenario and Variable (Aggregating across bins and windows)
-        # Note: Usually we aggregate across bins for a specific window.
-        # Here we simplify for the report: Max correlation found? Or Mean?
-        # Let's save the detailed aggregation per window/scenario.
-
+        # Aggregate across bins per (scenario, variable, window).
         groups = df_res.groupby(['scenario', 'parameter_1', 'window'])
         for name, group in groups:
             sum_w = group['weight'].sum()
             mean_z = (group['z'] * group['weight']).sum() / sum_w
             mean_rho = np.tanh(mean_z)
-            p_val = p_value_from_t(mean_rho, group['n_eff'].sum())
+            n_total = group['n'].sum()
+            p_val = p_value_from_t(mean_rho, n_total)
 
             final_mech.append({
                 'scenario': name[0],
@@ -254,7 +267,9 @@ def main():
                 'window': name[2],
                 'spearman_r': mean_rho, # Renamed for auditor
                 'p_value': p_val,
-                'n_eff_total': group['n_eff'].sum()
+                'n_total': n_total,
+                'n_eff_total': np.nan,
+                'inference_method': 'not_computed_legacy_neff_invalid',
             })
 
         out_file = Config.RESULTS_DIR / 'spearman_mechanism_SII_vs_ENV.csv'
@@ -262,6 +277,10 @@ def main():
         print(f"  [SUCCESS] Analysis complete. Saved mechanism check to {out_file.name}")
     else:
         print("  [WARN] No mechanism results generated.")
+
+    if join_ledger:
+        Config.save_join_accounting(join_ledger, Config.REPORTS_INTEGRITY_DIR / "join_accounting_mechanism.csv")
+        print(f"[INFO] Join accounting saved: {Config.REPORTS_INTEGRITY_DIR / 'join_accounting_mechanism.csv'}")
 
 if __name__ == "__main__":
     main()

@@ -134,23 +134,27 @@ def neff_factor_xy(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float]:
 def spearman_with_neff(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float, float]:
     """
     Returns (rho, p_adj, n_eff, z) where z = arctanh(rho).
+
+    Notes
+    -----
+    Pooled space-time effective sample size is intentionally not computed here:
+    the input rows within a temperature bin are a mixture of dates and grid
+    cells, not a single continuous time series. The p-value is based on the raw
+    pairwise sample size, which is transparent and conservative relative to any
+    inflated effective-N estimate.
     """
     rho, _ = stats.spearmanr(x, y)
     rho = float(rho) if np.isfinite(rho) else np.nan
-
-    factor, _, _ = neff_factor_xy(x, y)
     n_raw = len(x)
-    n_eff = max(2.0, n_raw * factor)
 
     if not np.isfinite(rho):
-        return np.nan, np.nan, float(n_eff), np.nan
+        return np.nan, np.nan, np.nan, np.nan
 
     if abs(rho) >= 1.0:
-        t_stat = np.inf
+        p_adj = 0.0
     else:
-        t_stat = rho * np.sqrt((n_eff - 2.0) / (1.0 - rho * rho))
-
-    p_adj = 2.0 * (1.0 - stats.t.cdf(abs(t_stat), df=max(1.0, n_eff - 2.0)))
+        t_stat = rho * np.sqrt((n_raw - 2.0) / (1.0 - rho * rho))
+        p_adj = 2.0 * (1.0 - stats.t.cdf(abs(t_stat), df=max(1.0, n_raw - 2.0)))
 
     # Fisher z (for profile aggregation)
     if abs(rho) >= 1.0:
@@ -158,7 +162,7 @@ def spearman_with_neff(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, floa
     else:
         z = float(np.arctanh(rho))
 
-    return rho, float(p_adj), float(n_eff), z
+    return rho, float(p_adj), np.nan, z
 
 
 def rank_gaussian(x: np.ndarray) -> np.ndarray:

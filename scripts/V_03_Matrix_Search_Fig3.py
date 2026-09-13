@@ -84,23 +84,14 @@ class Config:
 
 def _get_temperature_range_labels() -> List[str]:
     """Get formatted temperature range labels from CommonConfig.TEMP_RANGES."""
-    temp_ranges = getattr(CommonConfig, "TEMP_RANGES_PHYSIO", {})
-
-    # Create formatted labels for each bin in BIN_ORDER
+    # Map each physiological bin label to the canonical label from Config.
+    label_to_id = {label: i for i, label in enumerate(CommonConfig.TEMP_LABELS_PHYSIO)}
     range_labels = []
     for bin_label in Config.BIN_ORDER:
-        if bin_label in temp_ranges:
-            low, high = temp_ranges[bin_label]
-            # Format the range string
-            if low == -np.inf:
-                range_labels.append(f"<{high}°C")
-            elif high == np.inf:
-                range_labels.append(f"≥{low}°C")
-            else:
-                range_labels.append(f"{low}-{high}°C")
+        if bin_label in label_to_id:
+            range_labels.append(CommonConfig.TEMP_RANGES.get(label_to_id[bin_label], bin_label.replace("_", " ")))
         else:
             range_labels.append(bin_label.replace("_", " "))
-
     return range_labels
 
 def _compute_physio_centers() -> Dict[str, float]:

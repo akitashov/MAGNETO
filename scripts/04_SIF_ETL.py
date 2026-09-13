@@ -47,6 +47,7 @@ Columns structure:
 """
 
 import os
+import re
 import shutil
 import pandas as pd
 import numpy as np
@@ -263,67 +264,104 @@ def aggregate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     aggregated.replace([np.inf, -np.inf], np.nan, inplace=True)
     return aggregated
 
-def process_single_file_raw(sif_file):
-    """
-    Parse one OCO-2 LtSIF NetCDF file into a row-wise DataFrame of valid observations.
+# Anchored regex for OCO-2 Lite SIF filenames: oco2_LtSIF_YYMMDD_*.nc4
+OCO2_FILENAME_RE = re.compile(r"^oco2_LtSIF_(\d{6})_.*\.nc4$")
 
-    Processing
-    ----------
-    - Reads lat/lon and SIF bands
-    - Applies quality mask (GoodOrBad / Quality_Flag)
-    - Snaps lat/lon to the target 0.5° grid
-    - Extracts date from filename
+
+def parse_oco2_filename(filename: str, expected_year: int) -> tuple[pd.Timestamp, str]:
+    """
+    Parse the acquisition date from an OCO-2 Lite SIF filename.
 
     Returns
     -------
-    pd.DataFrame | None
-        DataFrame with columns:
-        date, latitude, longitude, lat_id, lon_id, sif_740nm, sif_757nm, sif_771nm
-        or None if file is invalid/unreadable.
+    (date, status) where status is 'parsed', 'rejected_malformed', or
+    'rejected_year_mismatch'.
     """
+    m = OCO2_FILENAME_RE.match(filename)
+    if not m:
+        return pd.NaT, "rejected_malformed"
+
+    date_str = m.group(1)
     try:
-        with xr.open_dataset(sif_file) as ds:
-            if 'Latitude' in ds: lat, lon = ds['Latitude'].values, ds['Longitude'].values
-            else: return None
+        date = pd.to_datetime(date_str, format="%y%m%d")
+    except Exception:
+        return pd.NaT, "rejected_malformed"
 
-            sif_740 = ds['Daily_SIF_740nm'].values.flatten()
-            sif_757 = ds['Daily_SIF_757nm'].values.flatten()
-            sif_771 = ds['Daily_SIF_771nm'].values.flatten()
+    # Allow a short tolerance for files whose date straddles the calendar year.
+    if abs(date.year - expected_year) > 0:
+        return date, "rejected_year_mismatch"
+    return date, "parsed"
 
-            if 'SimplyGoodOrBadQualityFlag' in ds: q_mask = (ds['SimplyGoodOrBadQualityFlag'].values.flatten() == 0)
-            elif 'Quality_Flag' in ds: q_mask = (ds['Quality_Flag'].values.flatten() == 0)
-            else: return None
 
-            valid_idx = np.where(q_mask)[0]
-            if len(valid_idx) == 0: return None
+def process_single_file_raw(sif_file, expected_year: int):
+    """
+    Parse one OCO-2 LtSIF NetCDF file into a row-wise DataFrame of valid observations.
 
-            try:
-                date_str = sif_file.name.split('_')[2]
-                date = pd.to_datetime(date_str, format='%y%m%d')
-            except: return None
+    Raises
+    ------
+    ValueError
+        If the filename is malformed, the year mismatches, or the file lacks
+        required variables/coordinates.
+    """
+    date, status = parse_oco2_filename(sif_file.name, expected_year)
+    if status == "rejected_malformed":
+        raise ValueError(f"OCO-2 filename does not match expected pattern: {sif_file.name}")
+    if status == "rejected_year_mismatch":
+        raise ValueError(
+            f"OCO-2 filename year mismatch: {sif_file.name} parsed date {date.date()} "
+            f"does not match expected year {expected_year}"
+        )
 
-            lat_vals = lat.flatten()[valid_idx]
-            lon_vals = lon.flatten()[valid_idx]
+    with xr.open_dataset(sif_file) as ds:
+        if "Latitude" not in ds:
+            raise ValueError(f"Latitude coordinate missing in {sif_file.name}")
+        lat = ds["Latitude"].values
+        lon = ds["Longitude"].values
 
-            # Snap
-            res = Config.TARGET_RESOLUTION
-            lat_s = (np.round(lat_vals / res) * res).astype(np.float32)
-            lon_s = (np.round(lon_vals / res) * res).astype(np.float32)
+        sif_740 = ds["Daily_SIF_740nm"].values.flatten()
+        sif_757 = ds["Daily_SIF_757nm"].values.flatten()
+        sif_771 = ds["Daily_SIF_771nm"].values.flatten()
 
-            return pd.DataFrame({
-                "date": date,
-                "latitude": lat_s,
-                "longitude": lon_s,
-                "lat_id": (lat_s * 100).round().astype(np.int16),
-                "lon_id": (lon_s * 100).round().astype(np.int16),
-                "sif_740nm": sif_740[valid_idx],
-                "sif_757nm": sif_757[valid_idx],
-                "sif_771nm": sif_771[valid_idx],
-            })
+        if "SimplyGoodOrBadQualityFlag" in ds:
+            q_mask = (ds["SimplyGoodOrBadQualityFlag"].values.flatten() == 0)
+        elif "Quality_Flag" in ds:
+            q_mask = (ds["Quality_Flag"].values.flatten() == 0)
+        else:
+            raise ValueError(f"No recognized quality flag in {sif_file.name}")
 
-    except: return None
+    valid_idx = np.where(q_mask)[0]
+    if len(valid_idx) == 0:
+        # No valid observations is not an error; return empty frame with correct schema.
+        return pd.DataFrame({
+            "date": pd.Series(dtype="datetime64[ns]"),
+            "latitude": pd.Series(dtype="float32"),
+            "longitude": pd.Series(dtype="float32"),
+            "lat_id": pd.Series(dtype="int16"),
+            "lon_id": pd.Series(dtype="int16"),
+            "sif_740nm": pd.Series(dtype="float32"),
+            "sif_757nm": pd.Series(dtype="float32"),
+            "sif_771nm": pd.Series(dtype="float32"),
+        })
 
-def process_year(year_files, year, modis, pbar):
+    lat_vals = lat.flatten()[valid_idx]
+    lon_vals = lon.flatten()[valid_idx]
+
+    # Snap to canonical grid and derive IDs from cell centers.
+    lat_s, lon_s = Config.snap_to_canonical(lat_vals, lon_vals)
+    lat_id, lon_id = Config.latlon_to_ids(lat_vals, lon_vals)
+
+    return pd.DataFrame({
+        "date": date,
+        "latitude": lat_s,
+        "longitude": lon_s,
+        "lat_id": lat_id,
+        "lon_id": lon_id,
+        "sif_740nm": sif_740[valid_idx],
+        "sif_757nm": sif_757[valid_idx],
+        "sif_771nm": sif_771[valid_idx],
+    })
+
+def process_year(year_files, year, modis, pbar, manifest):
     """
     Process all SIF files for a single year:
     - load MODIS slice for that year
@@ -345,22 +383,43 @@ def process_year(year_files, year, modis, pbar):
     batch_data = []
 
     for sif_file in year_files:
-        df = process_single_file_raw(sif_file)
+        try:
+            df = process_single_file_raw(sif_file, expected_year=year)
+            manifest.append({
+                "file_path": str(sif_file),
+                "filename": sif_file.name,
+                "parsed_date": df["date"].iloc[0] if not df.empty else pd.NaT,
+                "expected_year": year,
+                "status": "parsed",
+                "message": "",
+            })
+            if not df.empty:
+                batch_data.append(df)
+        except Exception as exc:
+            manifest.append({
+                "file_path": str(sif_file),
+                "filename": sif_file.name,
+                "parsed_date": pd.NaT,
+                "expected_year": year,
+                "status": "rejected_unreadable",
+                "message": str(exc),
+            })
         pbar.update(1)
-        if df is not None:
-            batch_data.append(df)
-            if len(batch_data) >= 50: # small sub-batch for memory safety
-                filtered = modis.filter_batch(pd.concat(batch_data))
-                if not filtered.empty: all_chunks.append(aggregate_dataframe(filtered))
-                batch_data = []
+
+        if len(batch_data) >= 50:  # small sub-batch for memory safety
+            filtered = modis.filter_batch(pd.concat(batch_data, ignore_index=True))
+            if not filtered.empty:
+                all_chunks.append(aggregate_dataframe(filtered))
+            batch_data = []
 
     if batch_data:
-        filtered = modis.filter_batch(pd.concat(batch_data))
-        if not filtered.empty: all_chunks.append(aggregate_dataframe(filtered))
+        filtered = modis.filter_batch(pd.concat(batch_data, ignore_index=True))
+        if not filtered.empty:
+            all_chunks.append(aggregate_dataframe(filtered))
 
     if all_chunks:
         # Re-aggregate year level
-        full_year = pd.concat(all_chunks)
+        full_year = pd.concat(all_chunks, ignore_index=True)
         final_grp = full_year.groupby(["date", "latitude", "longitude", "lat_id", "lon_id", "region_flags"])
         final_y = final_grp.agg({
             'sif_740nm': 'mean', 'sif_757nm': 'mean', 'sif_771nm': 'mean',
@@ -372,6 +431,8 @@ def process_year(year_files, year, modis, pbar):
 
 def main():
     clean_previous_artifacts()
+    Config.REPORTS_INTEGRITY_DIR.mkdir(parents=True, exist_ok=True)
+
     yearly_files = {}
     total_files = 0
     for year in range(START_YEAR, END_YEAR + 1):
@@ -380,12 +441,32 @@ def main():
             yearly_files[year] = files
             total_files += len(files)
 
-    if total_files == 0: return
+    if total_files == 0:
+        raise RuntimeError(f"No OCO-2 files found in {INPUT_DIR_OCO2} for years {START_YEAR}-{END_YEAR}")
 
+    manifest = []
     modis_handler = ModisHandler(Config.FILE_MODIS_PARQUET)
     with tqdm(total=total_files, unit="file") as pbar:
         for year in sorted(yearly_files.keys()):
-            process_year(yearly_files[year], year, modis_handler, pbar)
+            process_year(yearly_files[year], year, modis_handler, pbar, manifest)
+
+    # Persist manifest
+    manifest_df = pd.DataFrame(
+        manifest,
+        columns=["file_path", "filename", "parsed_date", "expected_year", "status", "message"],
+    )
+    manifest_path = Config.REPORTS_INTEGRITY_DIR / "oco2_input_manifest.csv"
+    manifest_df.to_csv(manifest_path, index=False)
+
+    n_rejected = (manifest_df["status"] != "parsed").sum()
+    print(f"\n[INFO] OCO-2 manifest saved: {manifest_path}")
+    print(f"[INFO] Files: {len(manifest_df)} total, {(manifest_df['status'] == 'parsed').sum()} parsed, {n_rejected} rejected")
+
+    if n_rejected > 0:
+        rejected = manifest_df[manifest_df["status"] != "parsed"]
+        print("[ERROR] Rejected OCO-2 files detected:")
+        print(rejected.to_string(index=False))
+        raise RuntimeError(f"{n_rejected} OCO-2 files were rejected; see {manifest_path}")
 
     print("\n[INFO] Final Merge...")
     files = sorted(Config.DATA_INTERIM.glob("sif_aggregated_*.feather"))
@@ -395,6 +476,8 @@ def main():
         for f in files:
             f.unlink()
         print(f"[SUCCESS] Saved {final_table.num_rows:,} rows with Region Flags.")
+    else:
+        raise RuntimeError("No yearly SIF shards were produced.")
 
 
 if __name__ == "__main__":

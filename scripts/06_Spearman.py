@@ -45,6 +45,7 @@ Columns:
 12. ci_upper    (float): Upper bound of 95% Confidence Interval.
 """
 
+import sys
 import pandas as pd
 import numpy as np
 import cupy as cp
@@ -60,89 +61,98 @@ import scipy.stats as stats
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# GPU KERNEL (Spearman + Neff)
+# GPU KERNEL (tie-aware Spearman)
 # ==============================================================================
 
-def gpu_spearman_matrix(residuals, data_matrix):
+def _rankdata_average_1d(x: cp.ndarray) -> cp.ndarray:
     """
-    Computes Spearman Rho matrix-wise on GPU.
-    residuals: (N,)
-    data_matrix: (N, M)
+    Average-rank transform of a 1-D CuPy array, matching
+    scipy.stats.rankdata(method='average'). Ties receive the mean of their
+    positions (1-based in SciPy, 0-based here; Pearson correlation is invariant
+    to the offset).
+    """
+    x = cp.asarray(x).ravel()
+    if x.size == 0:
+        return cp.empty_like(x)
+
+    idx = cp.argsort(x)
+    sorted_x = x[idx]
+
+    # Boundaries of tie groups in sorted order
+    diff = cp.empty(x.shape, dtype=bool)
+    diff[0] = True
+    diff[1:] = sorted_x[1:] != sorted_x[:-1]
+    group_idx = cp.cumsum(diff.astype(cp.int64)) - 1
+
+    n_groups = int(cp.max(group_idx)) + 1
+    positions = cp.arange(len(x), dtype=cp.float64)
+
+    # Small group-index array -> CPU bincount is fast and exact
+    group_idx_cpu = cp.asnumpy(group_idx)
+    sums = np.bincount(group_idx_cpu, weights=cp.asnumpy(positions), minlength=n_groups)
+    counts = np.bincount(group_idx_cpu, minlength=n_groups)
+    avg_ranks = cp.array(sums / counts, dtype=cp.float32)
+
+    ranks = avg_ranks[group_idx]
+    out = cp.empty_like(ranks)
+    out[idx] = ranks
+    return out
+
+
+def gpu_spearman_matrix(residuals: cp.ndarray, data_matrix: cp.ndarray):
+    """
+    Pairwise Spearman correlation between residuals and each column of data_matrix.
+
+    Parameters
+    ----------
+    residuals : (N,)
+    data_matrix : (N, M)
+
+    Returns
+    -------
+    rho : (M,) Spearman rho
+    n_eff : (M,) NaN (legacy pooled space-time n_eff is invalid and removed)
+    neff_factor : (M,) NaN
+
+    Notes
+    -----
+    - Uses average ranks for ties (matches scipy.stats.spearmanr).
+    - Filters NaNs pairwise per column.
+    - Does NOT compute a pooled space-time effective sample size; that estimate
+      is scientifically invalid for this data structure.
     """
     N, M = data_matrix.shape
 
-    # 1. Rank Transform
-    def get_ranks(x):
-        idx = cp.argsort(x, axis=0)
-        ranks = cp.empty_like(idx, dtype=cp.float32)
-        if x.ndim > 1:
-            for i in range(M):
-                ranks[idx[:, i], i] = cp.arange(N, dtype=cp.float32)
-        else:
-            ranks[idx] = cp.arange(N, dtype=cp.float32)
-        return ranks
+    rho_out = cp.empty(M, dtype=cp.float32)
+    rho_out[:] = cp.nan
 
-    res_ranks = get_ranks(residuals).reshape(-1, 1)
-    mat_ranks = get_ranks(data_matrix)
+    res_gpu = cp.asarray(residuals)
+    mat_gpu = cp.asarray(data_matrix)
 
-    # 2. Correlation
-    res_mean = (N - 1) / 2.0
-    mat_mean = (N - 1) / 2.0
+    for m in range(M):
+        y = mat_gpu[:, m]
+        mask = cp.isfinite(res_gpu) & cp.isfinite(y)
+        n_valid = int(cp.sum(mask))
+        if n_valid < 3:
+            continue
 
-    res_c = res_ranks - res_mean
-    mat_c = mat_ranks - mat_mean
+        x_rank = _rankdata_average_1d(res_gpu[mask]).astype(cp.float64)
+        y_rank = _rankdata_average_1d(y[mask]).astype(cp.float64)
 
-    # Dot product for covariance
-    numer = cp.dot(res_c.T, mat_centered := mat_c).flatten()
+        x_mean = cp.mean(x_rank)
+        y_mean = cp.mean(y_rank)
+        xm = x_rank - x_mean
+        ym = y_rank - y_mean
 
-    # Variances
-    res_ss = cp.sum(res_c**2)
-    mat_ss = cp.sum(mat_c**2, axis=0)
+        num = cp.sum(xm * ym)
+        den = cp.sqrt(cp.sum(xm ** 2) * cp.sum(ym ** 2))
+        if den > 0:
+            rho_out[m] = float(num / den)
 
-    rho = numer / cp.sqrt(res_ss * mat_ss)
-
-    # 3. Neff (Pyper–Peterman / Chelton: sum of autocorrelation products)
-    def autocorr_lag(arr_2d, k: int):
-        """
-        Lag-k autocorrelation for each column of arr_2d (shape: [N, M] or [N, 1]).
-        Returns shape: (M,) or (1,).
-        """
-        x0 = arr_2d[:-k]
-        xk = arr_2d[k:]
-        x0 = x0 - cp.mean(x0, axis=0)
-        xk = xk - cp.mean(xk, axis=0)
-        num = cp.sum(x0 * xk, axis=0)
-        den = cp.sqrt(cp.sum(x0**2, axis=0) * cp.sum(xk**2, axis=0))
-        return num / den
-
-    # choose max lag; must be < N
-    K = int(getattr(Config, "NEFF_MAX_LAG", 60))
-    K = max(1, min(K, N - 2))
-
-    # r_res(k): shape (K,) ; r_mat(k): shape (K, M)
-    r_res = cp.empty((K,), dtype=cp.float32)
-    r_mat = cp.empty((K, M), dtype=cp.float32)
-
-    for k in range(1, K + 1):
-        rr = autocorr_lag(res_ranks, k)
-        rm = autocorr_lag(mat_ranks, k)
-
-        # clip to avoid singularities
-        r_res[k - 1] = cp.clip(rr, -0.99, 0.99)[0]   # residual is (N,1)
-        r_mat[k - 1] = cp.clip(rm, -0.99, 0.99)      # vector (M,)
-
-    # Sum of products across lags: shape (M,)
-    s = cp.sum(r_res.reshape(-1, 1) * r_mat, axis=0)
-
-    denom = 1.0 + 2.0 * s
-    denom = cp.maximum(denom, 1e-3)  # safety
-
-    n_eff = cp.maximum(2.0, N / denom)
-
-    # keep a "factor" output compatible with your downstream CSV (optional)
-    neff_factor = n_eff / float(N)
-
-    return rho, n_eff, neff_factor
+    # Legacy pooled space-time n_eff is intentionally not computed.
+    n_eff_out = cp.full(M, cp.nan, dtype=cp.float32)
+    neff_factor_out = cp.full(M, cp.nan, dtype=cp.float32)
+    return rho_out, n_eff_out, neff_factor_out
 
 # ==============================================================================
 # SPATIAL STREAMING ANALYZER
@@ -157,9 +167,10 @@ class SpatialCorrelationAnalyzer:
         self.omni_vars = [c for c in num_cols if c not in ['year', 'day', 'hour']]
 
         Config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        Config.REPORTS_INTEGRITY_DIR.mkdir(parents=True, exist_ok=True)
 
         # Load Flags (Lightweight map)
-        print("[INFO] Loading Region Flags...")
+        print("[INFO] Loading Region Flags...", flush=True)
         self.df_flags = pd.read_feather(Config.FILE_SIF_FINAL, columns=['lat_id', 'lon_id', 'region_flags', 'date'])
         # Flags are kept dynamic (linked to date) to account for LAI changes.
         # Kept in memory as size is manageable (~2-3 GB).
@@ -168,6 +179,9 @@ class SpatialCorrelationAnalyzer:
         self.era5_schema = pq.read_schema(Config.FILE_ERA5_PARQUET).names
         self.temp_col = self._find_temp_col()
         self.env_vars = self._get_env_vars()
+
+        # Join accounting ledger
+        self.join_ledger: list[dict] = []
 
     def _find_temp_col(self):
         candidates = [Config.TEMP_CONTEXT_COL, f"temp_c_ma{Config.CONTEXT_WINDOW_DAYS}"]
@@ -185,92 +199,169 @@ class SpatialCorrelationAnalyzer:
                 elif c2 in self.era5_schema: vars_.append(c2)
         return sorted(list(set(vars_)))
 
-    def load_scenario_data(self, target, scenario_name):
+    def load_target_data(self, target):
         """
-        Reads ERA5/SIF data filtering strictly for the given scenario to save RAM.
+        Load residuals + flags + ERA5 + OMNI once per target, then apply scenario
+        masks in-memory. This avoids streaming ERA5 once per scenario.
         """
-        print(f"  > Streaming data for {scenario_name}...")
+        print(f"[Spearman] Loading target data for {target}...", flush=True)
 
-        # 1. Identify valid (lat, lon) pairs for this scenario
-        # We process Flags first to get a mask
-        mask = Config.scenario_mask(self.df_flags["region_flags"].values, scenario_name)
-        valid_flags = self.df_flags[mask]
-
-        if valid_flags.empty: return None
-
-        # Create a set of valid locations for fast lookup
-        # Optimization: Stream ERA5 data in batches and filter immediately
-        # by merging with valid_flags on [lat, lon, date].
-        # Unmatched rows are dropped to save memory.
-
-        # Load Residuals (Target)
+        # 1. Stream residuals and inner-join with full flags.
         res_path = Config.DIR_SIF_MODEL / f"sif_residuals_{target}.parquet"
-        df_res = pd.read_parquet(res_path)
-
-        # Merge Residuals + Valid Flags (This defines our "Target Universe")
-        # Only keep rows that are in the scenario
-        target_universe = pd.merge(df_res, valid_flags[['date', 'lat_id', 'lon_id']], on=['date', 'lat_id', 'lon_id'])
-        del df_res
-
-        if target_universe.empty: return None
-
-        # 2. Stream ERA5 and merge with Target Universe
-        # We will accumulate chunks
-        accumulated_era5 = []
-
-        # Columns to read from ERA5
-        cols_to_read = ['date', 'lat_id', 'lon_id', self.temp_col] + self.env_vars
-
-        parquet_file = pq.ParquetFile(Config.FILE_ERA5_PARQUET)
-
-        # Iterate over batches (e.g. 500k rows)
-        for batch in parquet_file.iter_batches(batch_size=500000, columns=cols_to_read):
+        res_pf = pq.ParquetFile(res_path)
+        res_batch_size = 5_000_000
+        total_res_batches = max(1, (res_pf.metadata.num_rows + res_batch_size - 1) // res_batch_size)
+        accumulated = []
+        for batch in tqdm(
+            res_pf.iter_batches(batch_size=res_batch_size, columns=['date', 'lat_id', 'lon_id', 'residual']),
+            total=total_res_batches,
+            desc=f"    Residuals {target}",
+            file=sys.stdout,
+            miniters=1,
+            ncols=80,
+        ):
             batch_df = batch.to_pandas()
-            batch_df['date'] = pd.to_datetime(batch_df['date'])
+            batch_df['date'] = pd.to_datetime(batch_df['date']).dt.normalize()
+            batch_df['lat_id'] = batch_df['lat_id'].astype('int32')
+            batch_df['lon_id'] = batch_df['lon_id'].astype('int32')
 
-            # INNER JOIN with Target Universe
-            # This automatically drops oceans/deserts/irrelevant pixels
-            merged_chunk = pd.merge(target_universe, batch_df, on=['date', 'lat_id', 'lon_id'], how='inner')
+            merged = Config.merge_with_accounting(
+                batch_df,
+                self.df_flags[['date', 'lat_id', 'lon_id', 'region_flags']],
+                on=['date', 'lat_id', 'lon_id'],
+                how='inner',
+                validate='many_to_one',
+                stage=f'spearman_{target}_residuals_x_flags_batch',
+                ledger=self.join_ledger,
+            )
+            if not merged.empty:
+                accumulated.append(merged)
+            del batch_df, merged
 
+        if not accumulated:
+            print(f"[Spearman] No residuals matched flags for target {target}", flush=True)
+            return None
+        target_df = pd.concat(accumulated, ignore_index=True)
+        del accumulated
+        gc.collect()
+        print(f"[Spearman] Residuals+flags merged: {len(target_df):,} rows", flush=True)
+
+        # 2. Add scenario mask columns in-memory.
+        scenario_cols = []
+        for scenario in Config.SCENARIO_MASKS.keys():
+            col = f"_scenario_{scenario}"
+            target_df[col] = Config.scenario_mask(target_df['region_flags'].values, scenario)
+            scenario_cols.append(col)
+        print(f"[Spearman] Scenario columns added: {scenario_cols}", flush=True)
+
+        # 3. Stream ERA5 once and merge with the full target dataframe.
+        accumulated_era5 = []
+        cols_to_read = ['date', 'lat_id', 'lon_id', self.temp_col] + self.env_vars
+        parquet_file = pq.ParquetFile(Config.FILE_ERA5_PARQUET)
+        era5_batch_size = 3_000_000
+        total_era5_batches = max(1, (parquet_file.metadata.num_rows + era5_batch_size - 1) // era5_batch_size)
+
+        for batch in tqdm(
+            parquet_file.iter_batches(batch_size=era5_batch_size, columns=cols_to_read),
+            total=total_era5_batches,
+            desc=f"    ERA5 {target}",
+            file=sys.stdout,
+            miniters=1,
+            ncols=80,
+        ):
+            batch_df = batch.to_pandas()
+            batch_df['date'] = pd.to_datetime(batch_df['date']).dt.normalize()
+            batch_df['lat_id'] = batch_df['lat_id'].astype('int32')
+            batch_df['lon_id'] = batch_df['lon_id'].astype('int32')
+
+            merged_chunk = Config.merge_with_accounting(
+                target_df,
+                batch_df,
+                on=['date', 'lat_id', 'lon_id'],
+                how='inner',
+                validate='many_to_one',
+                stage=f'spearman_{target}_universe_x_era5_batch',
+                ledger=self.join_ledger,
+            )
             if not merged_chunk.empty:
                 accumulated_era5.append(merged_chunk)
-
             del batch_df, merged_chunk
-            # gc.collect() # Optional, slightly slows down
 
-        if not accumulated_era5: return None
-
-        full_scenario_df = pd.concat(accumulated_era5, ignore_index=True)
-        del accumulated_era5, target_universe
+        if not accumulated_era5:
+            print(f"[Spearman] No ERA5 data matched target universe for {target}", flush=True)
+            return None
+        full_df = pd.concat(accumulated_era5, ignore_index=True)
+        del accumulated_era5, target_df
         gc.collect()
+        print(f"[Spearman] After ERA5 merge: {len(full_df):,} rows", flush=True)
 
-        # 3. Add OMNI
-        full_scenario_df = pd.merge(full_scenario_df, self.omni_df, on='date', how='inner')
+        # 4. Add OMNI once.
+        full_df = Config.merge_with_accounting(
+            full_df,
+            self.omni_df,
+            on='date',
+            how='inner',
+            validate='many_to_one',
+            stage=f'spearman_{target}_x_omni',
+            ledger=self.join_ledger,
+        )
+        print(f"[Spearman] After OMNI merge: {len(full_df):,} rows", flush=True)
 
-        return full_scenario_df
+        return full_df
 
-    def p_value_from_t(self, rho, n_eff):
-        if abs(rho) >= 1.0: return 0.0
-        t_stat = rho * np.sqrt((n_eff - 2) / (1 - rho**2))
-        return 2 * (1 - stats.t.cdf(abs(t_stat), df=n_eff - 2))
+    def p_value_from_t(self, rho, n_eff, n_raw):
+        # n_eff is NaN because pooled space-time autocorrelation is invalid.
+        # Fall back to the raw pairwise sample size for the p-value, which is
+        # transparent and conservative relative to any inflated effective-N.
+        n_use = int(n_eff) if np.isfinite(n_eff) and n_eff > 2 else int(n_raw)
+        if n_use <= 2:
+            return np.nan
+        if abs(rho) >= 1.0:
+            return 0.0
+        t_stat = rho * np.sqrt((n_use - 2) / (1 - rho**2))
+        return 2 * (1 - stats.t.cdf(abs(t_stat), df=n_use - 2))
 
     def run_analysis(self):
         targets = getattr(Config, "SPEARMAN_TARGETS", ["sif_740nm", "sif_stress_index"])
         all_vars = self.omni_vars + self.env_vars
 
-        print(f"[INFO] Analysis Variables: {len(all_vars)}")
+        print(f"[INFO] Analysis Variables: {len(all_vars)}", flush=True)
 
         for target in tqdm(targets, desc="Targets"):
-            # We iterate scenarios FIRST to minimize peak RAM
-            # (Load only SAA, process, dump. Load only Global, process, dump.)
+            print(f"[Spearman] Starting target {target}", flush=True)
+            scenarios = list(Config.SCENARIO_MASKS.keys())
 
-            scenarios = Config.SCENARIO_MASKS.keys()
+            # Resume at target level: skip entirely if all scenarios already done.
+            missing_scenarios = []
+            for scenario in scenarios:
+                out_file = Config.RESULTS_DIR / f"spearman_{target}_{scenario}.csv"
+                if out_file.exists() and out_file.stat().st_size > 0:
+                    print(f"[Spearman] Skipping {target}/{scenario}: output already exists ({out_file})", flush=True)
+                else:
+                    missing_scenarios.append(scenario)
 
-            for scenario in tqdm(scenarios, desc=f"Scenarios ({target})", leave=False):
-                # 1. Load Filtered Data (RAM Efficient)
-                scen_df = self.load_scenario_data(target, scenario)
+            if not missing_scenarios:
+                print(f"[Spearman] All scenarios for target {target} already computed. Skipping target.", flush=True)
+                continue
 
-                if scen_df is None or len(scen_df) < 1000:
+            # Load all data for this target once.
+            full_df = self.load_target_data(target)
+            if full_df is None:
+                continue
+
+            for scenario in tqdm(missing_scenarios, desc=f"Scenarios ({target})", leave=False):
+                print(f"[Spearman] Target={target} Scenario={scenario}", flush=True)
+
+                scenario_col = f"_scenario_{scenario}"
+                if scenario_col not in full_df.columns:
+                    print(f"[Spearman] Skipping {target}/{scenario}: scenario column missing", flush=True)
+                    continue
+
+                scen_df = full_df[full_df[scenario_col]].copy()
+                scen_df = scen_df.drop(columns=[c for c in scen_df.columns if c.startswith("_scenario_")])
+
+                if len(scen_df) < 1000:
+                    print(f"[Spearman] Skipping {target}/{scenario}: too few rows ({len(scen_df)})", flush=True)
                     continue
 
                 # 2. Binning
@@ -278,30 +369,31 @@ class SpatialCorrelationAnalyzer:
                     tb = Config.bin_temperature(scen_df[self.temp_col])
                     scen_df = scen_df.join(tb)
                 except Exception as e:
-                    print(f"  Binning error: {e}")
+                    print(f"[Spearman] Binning error for {target}/{scenario}: {e}", flush=True)
                     continue
 
                 results = []
                 unique_bins = sorted(scen_df["temp_bin_id"].dropna().unique())
+                print(f"[Spearman] Temperature bins: {unique_bins}", flush=True)
 
                 # 3. GPU Compute per Bin
                 for b_id in unique_bins:
                     bin_df = scen_df[scen_df["temp_bin_id"] == b_id].dropna(subset=["residual"] + all_vars)
-                    if len(bin_df) < 50: continue
+                    if len(bin_df) < 50:
+                        continue
 
-                    # Prepare GPU Arrays
+                    bin_label = str(bin_df["temp_bin_label"].iloc[0])
+                    print(f"[Spearman]   Bin {b_id} ({bin_label}): n={len(bin_df):,}, computing {len(all_vars)} correlations on GPU...", flush=True)
+
                     res_gpu = cp.array(bin_df["residual"].values, dtype=cp.float32)
                     mat_gpu = cp.array(bin_df[all_vars].values, dtype=cp.float32)
 
-                    # Calculate
                     rhos, neffs, factors = gpu_spearman_matrix(res_gpu, mat_gpu)
 
-                    # Download
                     rhos_cpu = cp.asnumpy(rhos)
                     neff_cpu = cp.asnumpy(neffs)
                     fact_cpu = cp.asnumpy(factors)
 
-                    bin_label = str(bin_df["temp_bin_label"].iloc[0])
                     temp_mean = float(bin_df[self.temp_col].mean())
                     n_samp = len(bin_df)
 
@@ -316,7 +408,8 @@ class SpatialCorrelationAnalyzer:
                             "n_eff": float(neff_cpu[i]),
                             "neff_factor": float(fact_cpu[i]),
                             "n": n_samp,
-                            "p_adj": self.p_value_from_t(float(rhos_cpu[i]), float(neff_cpu[i]))
+                            "p_adj": self.p_value_from_t(float(rhos_cpu[i]), float(neff_cpu[i]), n_samp),
+                            "inference_method": "not_computed_legacy_neff_invalid",
                         })
 
                     del res_gpu, mat_gpu
@@ -326,9 +419,21 @@ class SpatialCorrelationAnalyzer:
                     out_df = pd.DataFrame(results)
                     out_file = Config.RESULTS_DIR / f"spearman_{target}_{scenario}.csv"
                     out_df.to_csv(out_file, index=False)
+                    print(f"[Spearman] Saved {out_file} ({len(out_df):,} rows)", flush=True)
 
                 del scen_df
                 gc.collect()
+
+            del full_df
+            gc.collect()
+
+        # Persist join accounting for this target's scenarios.
+        if self.join_ledger:
+            Config.save_join_accounting(
+                self.join_ledger,
+                Config.REPORTS_INTEGRITY_DIR / "join_accounting_spearman.csv",
+            )
+            print(f"[INFO] Join accounting saved: {Config.REPORTS_INTEGRITY_DIR / 'join_accounting_spearman.csv'}", flush=True)
 
 if __name__ == "__main__":
     SpatialCorrelationAnalyzer().run_analysis()

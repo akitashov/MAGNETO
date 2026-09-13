@@ -201,21 +201,24 @@ def main() -> None:
     # Feature engineering
     num_cols = daily.select_dtypes(include=[np.number]).columns.tolist()
 
-    # Precompute smoothed version for lag generation (optional)
-    # Note: we smooth BEFORE shifting to reduce aliasing artifacts in lags.
-    if lag_smooth_w >= 2:
-        smoothed = daily[num_cols].rolling(window=lag_smooth_w, center=lag_smooth_center, min_periods=1).mean()
-    else:
-        smoothed = daily[num_cols]
-
     for col in num_cols:
         # Moving averages (dose) - shift(1) means "use yesterday and before" (no leakage)
         for w in Config.MA_WINDOWS:
             daily[f"{col}_ma{w}"] = daily[col].shift(1).rolling(window=w, min_periods=1).mean()
 
-        # Discrete lags (signal/presensing)
+        # Discrete lags (signal/presensing).
+        # CRITICAL: shift FIRST, then apply a trailing smoothing window so that the
+        # value at day t never leaks into lag1(t).
         for l in Config.DISCRETE_LAGS:
-            daily[f"{col}_lag{l}"] = smoothed[col].shift(l)
+            lagged = daily[col].shift(l)
+            if lag_smooth_w >= 2:
+                daily[f"{col}_lag{l}"] = lagged.rolling(
+                    window=lag_smooth_w,
+                    center=False,
+                    min_periods=1,
+                ).mean()
+            else:
+                daily[f"{col}_lag{l}"] = lagged
 
         # First difference (mostly diagnostic; can be useful downstream)
         daily[f"{col}_diff"] = daily[col].diff()

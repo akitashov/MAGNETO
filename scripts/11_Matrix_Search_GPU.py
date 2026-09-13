@@ -58,6 +58,7 @@ Each row represents a specific model configuration. Columns include:
 """
 
 
+import argparse
 import pandas as pd
 import numpy as np
 import cupy as cp
@@ -119,9 +120,10 @@ def solve_ols_gpu(y_vec, X_mat):
 # ==============================================================================
 
 class MatrixSearchEngine:
-    def __init__(self):
+    def __init__(self, overwrite: bool = False):
         # --- EXECUTION CONFIGURATION ---
-        self.SKIP_EXISTING = True
+        # Default: skip existing valid files. Use --overwrite to force recalculation.
+        self.overwrite = overwrite
         # -------------------------------
 
         self.era5_path = Config.FILE_ERA5_PARQUET
@@ -135,6 +137,8 @@ class MatrixSearchEngine:
             self.df_omni = pd.read_feather(self.omni_path)
         else:
             raise FileNotFoundError(f"OMNI file missing: {self.omni_path}")
+
+        self.join_ledger: list[dict] = []
 
     def _is_file_valid(self, path):
         """
@@ -192,7 +196,7 @@ class MatrixSearchEngine:
         return pd.concat(accumulated, ignore_index=True)
 
     def run(self):
-        mode_str = "RESUME (Smart Validation)" if self.SKIP_EXISTING else "OVERWRITE (Full Run)"
+        mode_str = "OVERWRITE (Full Run)" if self.overwrite else "RESUME (Smart Validation)"
         print(f"[INFO] Starting Memory-Safe Multivariate Matrix Search. Mode: {mode_str}")
         Config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -201,7 +205,7 @@ class MatrixSearchEngine:
             if not res_file.exists(): continue
 
             # --- TARGET LEVEL SMART SKIP ---
-            if self.SKIP_EXISTING:
+            if not self.overwrite:
                 all_valid = True
                 for sc in Config.SCENARIO_MASKS.keys():
                     out_check = Config.RESULTS_DIR / f"matrix_search_{target}_{sc}.csv"
@@ -225,7 +229,7 @@ class MatrixSearchEngine:
                 out_path = Config.RESULTS_DIR / f"matrix_search_{target}_{scenario}.csv"
 
                 # --- SCENARIO LEVEL SMART SKIP ---
-                if self.SKIP_EXISTING:
+                if not self.overwrite:
                     if self._is_file_valid(out_path):
                         print(f"  [SKIP] Scenario {scenario} exists (Verified).")
                         continue
@@ -240,11 +244,27 @@ class MatrixSearchEngine:
                 if scen_flags.empty: continue
 
                 # 2. Merge SIF + Geo
-                skeleton = pd.merge(df_res, scen_flags, on=['date', 'lat_id', 'lon_id'])
+                skeleton = Config.merge_with_accounting(
+                    df_res,
+                    scen_flags,
+                    on=['date', 'lat_id', 'lon_id'],
+                    how='inner',
+                    validate='many_to_one',
+                    stage=f'matrix_{target}_{scenario}_residuals_x_flags',
+                    ledger=self.join_ledger,
+                )
                 if skeleton.empty: continue
 
                 # 3. Merge OMNI
-                skeleton = pd.merge(skeleton, self.df_omni, on='date')
+                skeleton = Config.merge_with_accounting(
+                    skeleton,
+                    self.df_omni,
+                    on='date',
+                    how='inner',
+                    validate='many_to_one',
+                    stage=f'matrix_{target}_{scenario}_x_omni',
+                    ledger=self.join_ledger,
+                )
 
                 # 4. Stream ERA5
                 print(f"  Streaming ERA5 for {scenario} ({len(skeleton)} rows)...")
@@ -255,7 +275,15 @@ class MatrixSearchEngine:
                     print("    [WARN] No ERA5 data found.")
                     continue
 
-                df_full = pd.merge(skeleton, df_env, on=['date', 'lat_id', 'lon_id'])
+                df_full = Config.merge_with_accounting(
+                    skeleton,
+                    df_env,
+                    on=['date', 'lat_id', 'lon_id'],
+                    how='inner',
+                    validate='many_to_one',
+                    stage=f'matrix_{target}_{scenario}_x_era5',
+                    ledger=self.join_ledger,
+                )
 
                 # 5. Binning
                 if 'temp_c_ma10' not in df_full.columns:
@@ -282,12 +310,9 @@ class MatrixSearchEngine:
                     y = bin_df['residual'].values
                     N = len(y)
 
-                    if N > 10:
-                        r1 = np.corrcoef(y[:-1], y[1:])[0, 1]
-                        if np.isnan(r1): r1 = 0.5
-                        n_eff = N * (1 - r1) / (1 + r1)
-                    else:
-                        n_eff = N
+                    # Legacy pooled space-time n_eff is invalid for pooled space-time
+                    # data. Use raw sample size for degrees of freedom.
+                    n_eff = np.nan
 
                     avail_cols = set(bin_df.columns)
                     valid_sii = [w for w in self.sii_wins if f'sii_mean_ma{w}' in avail_cols]
@@ -311,7 +336,8 @@ class MatrixSearchEngine:
                                 res = solve_ols_gpu(y, X)
 
                                 if res:
-                                    dof = max(1, n_eff - 4)
+                                    # Conservative: use raw N for degrees of freedom.
+                                    dof = max(1, N - 4)
                                     p_vals = 2 * (1 - stats.t.cdf(np.abs(res['t']), df=dof))
 
                                     results.append({
@@ -321,6 +347,7 @@ class MatrixSearchEngine:
                                         "vpd_window": w_vpd,
                                         "n": N,
                                         "n_eff": n_eff,
+                                        "inference_method": "not_computed_legacy_neff_invalid",
                                         "rss": res['rss'],
                                         "beta_sii": res['beta'][0], "t_sii": res['t'][0], "p_sii": p_vals[0],
                                         "beta_par": res['beta'][1], "t_par": res['t'][1], "p_par": p_vals[1],
@@ -333,5 +360,23 @@ class MatrixSearchEngine:
 
             gc.collect()
 
+        if self.join_ledger:
+            Config.save_join_accounting(
+                self.join_ledger,
+                Config.REPORTS_INTEGRITY_DIR / "join_accounting_matrix.csv",
+            )
+            print(f"[INFO] Join accounting saved: {Config.REPORTS_INTEGRITY_DIR / 'join_accounting_matrix.csv'}")
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="GPU matrix search for MAGNETO v1")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Recalculate all matrix-search results even if valid files already exist.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    MatrixSearchEngine().run()
+    args = _parse_args()
+    MatrixSearchEngine(overwrite=args.overwrite).run()

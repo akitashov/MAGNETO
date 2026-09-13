@@ -91,3 +91,7 @@ venv/
 LOCAL_DATA_INVENTORY.txt
 REPOSITORY_CONTENT_AUDIT_*.md
 repository_reorganization_*.md
+
+# OS metadata
+.DS_Store
+Thumbs.db

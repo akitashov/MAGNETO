@@ -86,6 +86,76 @@ def normalize_percent(series, name):
     print(f"[WARN] {name} unexpected range: min={mn}, max={mx}")
     return series
 
+
+def audit_modis_files(file_paths, var_mapping: dict) -> pd.DataFrame:
+    """
+    Scan MODIS input files and report ranges of key variables and coordinates.
+    """
+    records = []
+    for fp in tqdm(file_paths, desc="MODIS audit", leave=False):
+        try:
+            with xr.open_dataset(fp) as ds:
+                required_vars = list(var_mapping.keys())
+                missing = [v for v in required_vars if v not in ds.variables and v not in ds.data_vars]
+                if "lat" in ds.coords:
+                    lat_vals = ds.coords["lat"].values
+                elif "latitude" in ds.coords:
+                    lat_vals = ds.coords["latitude"].values
+                else:
+                    lat_vals = np.array([np.nan])
+                if "lon" in ds.coords:
+                    lon_vals = ds.coords["lon"].values
+                elif "longitude" in ds.coords:
+                    lon_vals = ds.coords["longitude"].values
+                else:
+                    lon_vals = np.array([np.nan])
+
+                def _range(arr):
+                    arr = np.asarray(arr)
+                    finite = arr[np.isfinite(arr)]
+                    return (float(finite.min()), float(finite.max())) if finite.size else (np.nan, np.nan)
+
+                def _get_var(name):
+                    if name in ds:
+                        return ds[name].values
+                    return np.array([np.nan])
+
+                cloud = _get_var("cloudfraction")
+                aerosol = _get_var("aerosolfraction")
+                qf = _get_var("primary_qualityflag")
+
+                records.append({
+                    "file": str(fp),
+                    "missing_vars": ",".join(missing),
+                    "lat_min": _range(lat_vals)[0],
+                    "lat_max": _range(lat_vals)[1],
+                    "lon_min": _range(lon_vals)[0],
+                    "lon_max": _range(lon_vals)[1],
+                    "cloud_min": _range(cloud)[0],
+                    "cloud_max": _range(cloud)[1],
+                    "aerosol_min": _range(aerosol)[0],
+                    "aerosol_max": _range(aerosol)[1],
+                    "quality_flag_unique": len(np.unique(qf[np.isfinite(qf)])) if np.isfinite(qf).any() else 0,
+                })
+        except Exception as exc:
+            records.append({
+                "file": str(fp),
+                "missing_vars": "",
+                "lat_min": np.nan,
+                "lat_max": np.nan,
+                "lon_min": np.nan,
+                "lon_max": np.nan,
+                "cloud_min": np.nan,
+                "cloud_max": np.nan,
+                "aerosol_min": np.nan,
+                "aerosol_max": np.nan,
+                "quality_flag_unique": -1,
+                "error": str(exc),
+            })
+
+    return pd.DataFrame(records)
+
+
 def snap_modis_date_to_period_start(dates: pd.Series, period_days: int, last_start_doy: int) -> pd.Series:
     """
     Snap timestamps to the start of the MODIS compositing period.
@@ -123,63 +193,71 @@ def process_modis_file(file_path, var_mapping: dict, target_res: float, period_d
             - cloud_fraction
             - aerosol_fraction
 
-            Empty DataFrame if file is invalid.
+    Raises:
+        ValueError on missing variables or invalid coordinates.
     """
-    try:
-        with xr.open_dataset(file_path) as ds:
-            # ensure all required variables exist
-            required_vars = list(var_mapping.keys())
-            missing = [v for v in required_vars if v not in ds.variables and v not in ds.data_vars]
-            if missing:
-                return pd.DataFrame()
+    with xr.open_dataset(file_path) as ds:
+        # ensure all required variables exist
+        required_vars = list(var_mapping.keys())
+        missing = [v for v in required_vars if v not in ds.variables and v not in ds.data_vars]
+        if missing:
+            raise ValueError(f"Missing variables in {file_path.name}: {missing}")
 
-            subset = ds[required_vars]
-            df = subset.to_dataframe().reset_index()
+        subset = ds[required_vars]
+        df = subset.to_dataframe().reset_index()
 
-        # Rename to standard column names
-        rename_dict = dict(var_mapping)
-        if "lat" in df.columns:
-            rename_dict["lat"] = "latitude"
-        if "lon" in df.columns:
-            rename_dict["lon"] = "longitude"
-        if "time" in df.columns:
-            rename_dict["time"] = "date"
+    # Rename to standard column names
+    rename_dict = dict(var_mapping)
+    if "lat" in df.columns:
+        rename_dict["lat"] = "latitude"
+    if "lon" in df.columns:
+        rename_dict["lon"] = "longitude"
+    if "time" in df.columns:
+        rename_dict["time"] = "date"
 
-        df = df.rename(columns=rename_dict)
+    df = df.rename(columns=rename_dict)
 
-        # Guard: must have key coordinates/time
-        if not {"latitude", "longitude", "date"}.issubset(df.columns):
-            return pd.DataFrame()
+    # Guard: must have key coordinates/time
+    if not {"latitude", "longitude", "date"}.issubset(df.columns):
+        raise ValueError(f"Required coordinates missing in {file_path.name}: {set(df.columns)}")
 
-        # Snap to target grid
-        res = float(target_res)
-        df["latitude"] = (np.round(df["latitude"].astype("float64") / res) * res).astype("float32")
-        df["longitude"] = (np.round(df["longitude"].astype("float64") / res) * res).astype("float32")
+    # Snap to canonical grid. MODIS files are already on the intended 0.5°
+    # cell-center grid; snapping is effectively a consistency pass.
+    df["latitude"], df["longitude"] = Config.snap_to_canonical(
+        df["latitude"].astype("float64").values,
+        df["longitude"].astype("float64").values,
+    )
 
-        # Snap time to MODIS period start (e.g., 8-day)
-        df["date"] = snap_modis_date_to_period_start(df["date"], period_days=period_days, last_start_doy=last_start_doy)
+    # Snap time to MODIS period start (e.g., 8-day)
+    df["date"] = snap_modis_date_to_period_start(df["date"], period_days=period_days, last_start_doy=last_start_doy)
 
-        # Drop rows with broken timestamps after snapping
-        df = df.dropna(subset=["date"])
+    # Drop rows with broken timestamps after snapping
+    df = df.dropna(subset=["date"])
 
-        # Aggregate to (date, lat, lon)
-        df = df.groupby(["date", "latitude", "longitude"], as_index=False).mean(numeric_only=True)
+    if df.empty:
+        raise ValueError(f"No valid timestamps after snapping in {file_path.name}")
 
-        # IDs for joining
-        df["lat_id"] = (df["latitude"] * 100).round().astype("int16")
-        df["lon_id"] = (df["longitude"] * 100).round().astype("int16")
+    # Aggregate to (date, lat, lon)
+    df = df.groupby(["date", "latitude", "longitude"], as_index=False).mean(numeric_only=True)
 
-        # Enforce float32 on key vars if present
-        for col in ["lai", "quality_flag", "cloud_fraction", "aerosol_fraction"]:
-            if col in df.columns:
-                df[col] = df[col].astype("float32")
+    # IDs for joining (canonical cell-center grid)
+    df["lat_id"], df["lon_id"] = Config.latlon_to_ids(
+        df["latitude"].astype("float64").values,
+        df["longitude"].astype("float64").values,
+    )
 
-        return df
+    # Normalize percentages if the source is on a 0–1 scale.
+    for col, src in [("cloud_fraction", "cloudfraction"), ("aerosol_fraction", "aerosolfraction")]:
+        if col in df.columns:
+            df[col] = normalize_percent(df[col], src)
+            df[col] = df[col].astype("float32")
 
-    except Exception as e:
-        if verbose_errors:
-            tqdm.write(f"[MODIS ERROR] {file_path.name}: {e}")
-        return pd.DataFrame()
+    # Enforce float32 on key vars if present
+    for col in ["lai", "quality_flag"]:
+        if col in df.columns:
+            df[col] = df[col].astype("float32")
+
+    return df
 
 
 def main() -> None:
@@ -197,27 +275,50 @@ def main() -> None:
 
     out_path = Config.FILE_MODIS_PARQUET
     Config.DATA_INTERIM.mkdir(parents=True, exist_ok=True)
+    Config.REPORTS_INTEGRITY_DIR.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(input_dir.glob(file_pattern))
+    if not files:
+        raise FileNotFoundError(f"No MODIS files found in {input_dir} matching {file_pattern}")
+
+    # ---- Pre-processing audit ----
+    print("[INFO] Running MODIS input audit...")
+    audit_df = audit_modis_files(files, var_mapping)
+    audit_path = Config.REPORTS_INTEGRITY_DIR / "modis_input_audit.csv"
+    audit_df.to_csv(audit_path, index=False)
+    print(f"[INFO] MODIS audit saved: {audit_path}")
+    print(
+        f"[INFO] cloud_fraction range: {audit_df['cloud_min'].min():.3f} - {audit_df['cloud_max'].max():.3f}; "
+        f"aerosol_fraction range: {audit_df['aerosol_min'].min():.3f} - {audit_df['aerosol_max'].max():.3f}; "
+        f"longitude range: {audit_df['lon_min'].min():.3f} - {audit_df['lon_max'].max():.3f}"
+    )
+    failed_audit = audit_df[audit_df["quality_flag_unique"] == -1]
+    if not failed_audit.empty:
+        raise RuntimeError(f"MODIS audit failed for {len(failed_audit)} files; see {audit_path}")
 
     # Clean previous artifact
     if out_path.exists():
         os.remove(out_path)
 
-    files = sorted(input_dir.glob(file_pattern))
     total_rows = 0
+    n_failed = 0
 
     with tqdm(files, unit="file", desc="MODIS ETL") as pbar:
         for i, file_path in enumerate(pbar):
-            df = process_modis_file(
-                file_path=file_path,
-                var_mapping=var_mapping,
-                target_res=Config.TARGET_RESOLUTION,
-                period_days=period_days,
-                last_start_doy=last_start_doy,
-                verbose_errors=verbose_errors,
-            )
-
-            if df.empty:
-                continue
+            try:
+                df = process_modis_file(
+                    file_path=file_path,
+                    var_mapping=var_mapping,
+                    target_res=Config.TARGET_RESOLUTION,
+                    period_days=period_days,
+                    last_start_doy=last_start_doy,
+                    verbose_errors=verbose_errors,
+                )
+            except Exception as e:
+                n_failed += 1
+                if verbose_errors:
+                    tqdm.write(f"[MODIS ERROR] {file_path.name}: {e}")
+                raise RuntimeError(f"MODIS file failed: {file_path.name}: {e}") from e
 
             total_rows += len(df)
 

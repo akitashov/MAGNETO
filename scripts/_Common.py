@@ -47,6 +47,8 @@ from __future__ import annotations
 from pathlib import Path
 from enum import IntFlag
 from typing import Dict, Iterable, Optional, Tuple
+import datetime
+import hashlib
 
 import numpy as np
 import pandas as pd
@@ -101,6 +103,8 @@ class Config:
     RESULTS_DIR = PROJECT_ROOT / "results"
     REPORTS_ROOT = PROJECT_ROOT / "reports"
     META_ANALYSIS_DIR = REPORTS_ROOT / "meta-statistics"
+    REPORTS_INTEGRITY_DIR = REPORTS_ROOT / "integrity"
+    RUN_MANIFESTS_DIR = REPORTS_ROOT / "run_manifests"
 
     # Input Files
     OMNI_RAW_ZIP = DATA_RAW / "omni2_all_years.zip"
@@ -118,6 +122,12 @@ class Config:
     # CONSTANTS
     # --------------------------------------------------------------------------
     TARGET_RESOLUTION = 0.5
+
+    # Canonical 0.5° grid: cell centers are offset by resolution/2 from the
+    # domain edge. This matches the native MODIS 0.5° product registration and
+    # is the single target grid for ERA5 regridding and SIF/MODIS snapping.
+    CANONICAL_LAT_N_CELLS = int(180.0 / TARGET_RESOLUTION)  # 360
+    CANONICAL_LON_N_CELLS = int(360.0 / TARGET_RESOLUTION)  # 720
 
     # LAI masking
     LAI_VEGETATION_THRESHOLD = 0.15
@@ -195,12 +205,13 @@ class Config:
     ERA5_START_YEAR = 2014
     ERA5_END_YEAR_EXCLUSIVE = 2025
 
-    # File patterns per variable (year, month)
+    # File patterns per variable (year, month). Use named placeholders so the
+    # resolver can enforce zero-padded months unambiguously.
     ERA5_VAR_MAP = {
-        "t2m":  {"pattern": "era5_2m_temperature_{}_{}.nc"},
-        "d2m":  {"pattern": "era5_2m_dewpoint_temperature_{}_{}.nc"},
-        "ssrd": {"pattern": "era5_surface_solar_radiation_downwards_{}_{}.nc"},
-        "tcc":  {"pattern": "era5_total_cloud_cover_{}_{}.nc"},
+        "t2m":  {"pattern": "era5_2m_temperature_{year}_{month}.nc"},
+        "d2m":  {"pattern": "era5_2m_dewpoint_temperature_{year}_{month}.nc"},
+        "ssrd": {"pattern": "era5_surface_solar_radiation_downwards_{year}_{month}.nc"},
+        "tcc":  {"pattern": "era5_total_cloud_cover_{year}_{month}.nc"},
     }
 
     ERA5_PAR_FRACTION_OF_SSRD = 0.45
@@ -403,6 +414,115 @@ class Config:
 
         raise ValueError(f"Unknown temperature binning scheme: {scheme}")
 
+    @staticmethod
+    def merge_with_accounting(
+        left: pd.DataFrame,
+        right: pd.DataFrame,
+        on: list[str] | str,
+        how: str = "inner",
+        validate: str | None = None,
+        stage: str = "",
+        ledger: list[dict] | None = None,
+        **kwargs,
+    ) -> pd.DataFrame:
+        """
+        Wrapper around pd.merge that enforces cardinality and records join metrics.
+
+        Parameters
+        ----------
+        left, right : pd.DataFrame
+        on : str or list of str
+        how : str
+        validate : str | None
+            Passed to pd.merge. If None, the helper checks the actual uniqueness
+            of the join keys and picks 'one_to_one', 'one_to_many', or
+            'many_to_many' accordingly, then validates.
+        stage : str
+            Human-readable label for the join accounting ledger.
+        ledger : list[dict] | None
+            If provided, append a record with join metrics.
+        **kwargs
+            Additional arguments forwarded to pd.merge.
+
+        Returns
+        -------
+        pd.DataFrame
+            Merged result.
+
+        Raises
+        ------
+        ValueError
+            If the requested/cardinality validation fails or if an unexpected
+            many-to-many join is detected.
+        """
+        on_cols = [on] if isinstance(on, str) else list(on)
+
+        if validate is None:
+            left_unique = left[on_cols].drop_duplicates().shape[0] == left.shape[0]
+            right_unique = right[on_cols].drop_duplicates().shape[0] == right.shape[0]
+            if left_unique and right_unique:
+                validate = "one_to_one"
+            elif right_unique:
+                validate = "many_to_one"
+            elif left_unique:
+                validate = "one_to_many"
+            else:
+                validate = "many_to_many"
+
+        if validate == "many_to_many":
+            raise ValueError(
+                f"Join [{stage}] produced an unexpected many-to-many relationship "
+                f"on keys {on_cols}. Inspect duplicate keys before proceeding."
+            )
+
+        result = pd.merge(left, right, on=on_cols, how=how, validate=validate, **kwargs)
+
+        if ledger is not None:
+            left_keys = set(left[on_cols].apply(tuple, axis=1)) if len(on_cols) > 1 else set(left[on_cols].iloc[:, 0])
+            right_keys = set(right[on_cols].apply(tuple, axis=1)) if len(on_cols) > 1 else set(right[on_cols].iloc[:, 0])
+            matched_keys = left_keys & right_keys
+            unmatched_left = len(left_keys - right_keys)
+            unmatched_right = len(right_keys - left_keys)
+
+            # Year/month coverage
+            if "date" in result.columns:
+                result["date"] = pd.to_datetime(result["date"], errors="coerce")
+                years = sorted(result["date"].dt.year.dropna().unique().astype(int).tolist())
+                months = sorted(result["date"].dt.month.dropna().unique().astype(int).tolist())
+            else:
+                years = []
+                months = []
+
+            ledger.append({
+                "stage": stage,
+                "how": how,
+                "validate": validate,
+                "keys": "|".join(on_cols),
+                "left_rows": len(left),
+                "right_rows": len(right),
+                "result_rows": len(result),
+                "left_unique_keys": len(left_keys),
+                "right_unique_keys": len(right_keys),
+                "matched_keys": len(matched_keys),
+                "unmatched_left_keys": unmatched_left,
+                "unmatched_right_keys": unmatched_right,
+                "multiplication_factor": round(len(result) / max(len(left), 1), 6),
+                "years": "|".join(str(y) for y in years),
+                "months": "|".join(str(m) for m in months),
+            })
+
+        return result
+
+    @staticmethod
+    def save_join_accounting(ledger: list[dict], path: Path | None = None) -> pd.DataFrame:
+        """Persist join accounting ledger to CSV."""
+        if path is None:
+            path = Config.REPORTS_INTEGRITY_DIR / "join_accounting.csv"
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(ledger)
+        df.to_csv(path, index=False)
+        return df
 
     # --------------------------------------------------------------------------
     # GEOGRAPHY: bounding boxes centralized here
@@ -522,6 +642,188 @@ class Config:
         return flags.astype(np.int16)
 
     # --------------------------------------------------------------------------
+    # CANONICAL GRID (single source of truth for ERA5 / MODIS / SIF alignment)
+    # --------------------------------------------------------------------------
+    @staticmethod
+    def canonical_lat_centers() -> np.ndarray:
+        """Return 1-D array of canonical latitude cell centers."""
+        return (-90.0 + (np.arange(Config.CANONICAL_LAT_N_CELLS) + 0.5)
+                * Config.TARGET_RESOLUTION).astype(np.float32)
+
+    @staticmethod
+    def canonical_lon_centers() -> np.ndarray:
+        """Return 1-D array of canonical longitude cell centers."""
+        return (-180.0 + (np.arange(Config.CANONICAL_LON_N_CELLS) + 0.5)
+                * Config.TARGET_RESOLUTION).astype(np.float32)
+
+    @staticmethod
+    def normalize_longitude(lon: np.ndarray) -> np.ndarray:
+        """Wrap longitudes into the half-open interval [-180, 180)."""
+        lon = np.asarray(lon, dtype=np.float64)
+        return ((lon + 180.0) % 360.0) - 180.0
+
+    @staticmethod
+    def snap_to_canonical(lat: np.ndarray, lon: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Snap arbitrary lat/lon points to the canonical 0.5° cell centers.
+        Returns float32 arrays of snapped coordinates.
+        """
+        lat = np.asarray(lat, dtype=np.float64)
+        lon = Config.normalize_longitude(lon)
+        lat = np.clip(lat, -90.0, 90.0)
+
+        lat_i = np.floor((lat + 90.0) / Config.TARGET_RESOLUTION).astype(np.int64)
+        lat_i = np.clip(lat_i, 0, Config.CANONICAL_LAT_N_CELLS - 1)
+        lat_snap = -90.0 + (lat_i + 0.5) * Config.TARGET_RESOLUTION
+
+        lon_i = np.floor((lon + 180.0) / Config.TARGET_RESOLUTION).astype(np.int64)
+        lon_i = np.clip(lon_i, 0, Config.CANONICAL_LON_N_CELLS - 1)
+        lon_snap = -180.0 + (lon_i + 0.5) * Config.TARGET_RESOLUTION
+
+        return lat_snap.astype(np.float32), lon_snap.astype(np.float32)
+
+    @staticmethod
+    def latlon_to_ids(lat: np.ndarray, lon: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Convert lat/lon to int16 grid identifiers consistent with the canonical
+        cell-center grid. Longitude is normalized to [-180, 180) before ID
+        assignment so that 180° and -180° map to the same cell.
+        """
+        lat_snap, lon_snap = Config.snap_to_canonical(lat, lon)
+        lat_id = (lat_snap * 100).round().astype(np.int16)
+        lon_id = (lon_snap * 100).round().astype(np.int16)
+        return lat_id, lon_id
+
+    # --------------------------------------------------------------------------
+    # ERA5 INPUT RESOLVER & MANIFEST HELPERS
+    # --------------------------------------------------------------------------
+    @staticmethod
+    def resolve_era5_file(input_dir: Path, pattern: str, year: int, month: int) -> Path:
+        """
+        Resolve a single ERA5 input file for a given variable/year/month.
+
+        Parameters
+        ----------
+        input_dir : Path
+            Directory containing ERA5 NetCDF files.
+        pattern : str
+            Filename template with named placeholders {year} and {month}.
+        year : int
+        month : int
+
+        Returns
+        -------
+        Path
+            The resolved file path.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no candidate file exists.
+        ValueError
+            If more than one candidate exists (ambiguous padded/unpadded names).
+        """
+        input_dir = Path(input_dir)
+        month_padded = f"{month:02d}"
+        month_unpadded = str(month)
+
+        candidates: set[Path] = set()
+
+        # Primary: zero-padded month (canonical naming).
+        try:
+            candidate = input_dir / pattern.format(year=year, month=month_padded)
+        except KeyError as exc:
+            raise ValueError(
+                f"ERA5 pattern '{pattern}' must use named placeholders "
+                "{{year}} and {{month}}."
+            ) from exc
+        if candidate.exists():
+            candidates.add(candidate.resolve())
+
+        # Diagnostic/backward compatibility: unpadded month.
+        try:
+            candidate_unpadded = input_dir / pattern.format(year=year, month=month_unpadded)
+        except KeyError:
+            candidate_unpadded = None
+        if candidate_unpadded is not None and candidate_unpadded.exists():
+            candidates.add(candidate_unpadded.resolve())
+
+        if len(candidates) == 0:
+            expected = [str(input_dir / pattern.format(year=year, month=month_padded))]
+            if candidate_unpadded is not None:
+                expected.append(str(candidate_unpadded))
+            raise FileNotFoundError(
+                f"ERA5 file missing for year={year}, month={month:02d}. "
+                f"Pattern: {pattern!r}. Expected paths: {expected}"
+            )
+
+        if len(candidates) > 1:
+            raise ValueError(
+                f"Ambiguous ERA5 files for year={year}, month={month:02d}: "
+                f"{sorted(str(p) for p in candidates)}. "
+                "Remove the redundant unpadded variant."
+            )
+
+        return candidates.pop()
+
+    @staticmethod
+    def build_era5_manifest(input_dir: Path, output_path: Optional[Path] = None) -> pd.DataFrame:
+        """
+        Build a manifest of all mandatory ERA5 input files for 2014-2024.
+        Saves a CSV if output_path is provided.
+        """
+        input_dir = Path(input_dir)
+        records = []
+        for var_name, vinfo in Config.ERA5_VAR_MAP.items():
+            pattern = vinfo["pattern"]
+            for year in range(Config.ERA5_START_YEAR, Config.ERA5_END_YEAR_EXCLUSIVE):
+                for month in range(1, 13):
+                    try:
+                        path = Config.resolve_era5_file(input_dir, pattern, year, month)
+                        st = path.stat()
+                        with open(path, "rb") as f:
+                            sha = hashlib.file_digest(f, "sha256").hexdigest()
+                        variant = "padded" if f"_{month:02d}." in path.name else "unpadded"
+                        status = "ok"
+                    except FileNotFoundError:
+                        path = input_dir / pattern.format(year=year, month=f"{month:02d}")
+                        st = None
+                        sha = ""
+                        variant = "padded"
+                        status = "missing"
+                    except ValueError:
+                        path = input_dir / pattern.format(year=year, month=f"{month:02d}")
+                        st = None
+                        sha = ""
+                        variant = "ambiguous"
+                        status = "ambiguous"
+
+                    records.append({
+                        "variable": var_name,
+                        "year": year,
+                        "month": month,
+                        "resolved_path": str(path),
+                        "filename_variant": variant,
+                        "size_bytes": st.st_size if st else -1,
+                        "mtime": pd.to_datetime(st.st_mtime, unit="s").isoformat() if st else "",
+                        "sha256": sha,
+                        "status": status,
+                    })
+
+        df = pd.DataFrame(records)
+        if output_path is not None:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(output_path, index=False)
+        return df
+
+    @staticmethod
+    def make_run_id(timestamp: Optional[datetime.datetime] = None) -> str:
+        """Return a UTC run ID in the form YYYYMMDDTHHMMSSZ."""
+        ts = timestamp or datetime.datetime.now(datetime.timezone.utc)
+        return ts.strftime("%Y%m%dT%H%M%SZ")
+
+    # --------------------------------------------------------------------------
     # SCENARIOS: centralized definitions
     # --------------------------------------------------------------------------
     # Bitmask-based scenarios (cleaner than lambdas scattered across scripts)
@@ -587,12 +889,14 @@ class Config:
     # VISUALIZATIONS
     # --------------------------------------------------------------------------
 
+    # Human-readable labels that exactly match TEMP_BINS_PHYSIO. Keep this in
+    # sync with bin_temperature(); visualizations must derive labels from here.
     TEMP_RANGES = {
-        0: "≤ 10",
-        1: "10–19",
-        2: "19–26",
-        3: "26–31",
-        4: "> 31"
+        0: "< 7 °C",
+        1: "7–15 °C",
+        2: "15–25 °C",
+        3: "25–30 °C",
+        4: "≥ 30 °C",
     }
 
     # --- P-VALUE CONFIGURATION ---
